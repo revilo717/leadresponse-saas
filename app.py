@@ -224,6 +224,20 @@ def get_lead(lead_id):
 
 init_db()
 
+@app.route('/seed-demo')
+def seed_demo():
+    conn = db()
+    now = now_iso()
+    connect_token = 'connect_demo_12345'
+    try:
+        conn.execute(
+            'INSERT INTO sites (name, connect_token, booking_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+            ('Demo Site', connect_token, 'https://leadresponse.co.uk/contact/', now, now)
+        )
+        conn.commit()
+    except Exception:
+        pass
+    return jsonify({'connect_token': connect_token})
+
 if __name__ == '__main__':
-    init_db()
     app.run(host='0.0.0.0', port=5000, debug=True)
