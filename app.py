@@ -11,6 +11,8 @@ DB_PATH = BASE_DIR / 'leadresponse.sqlite'
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
 
+ALLOWED_STATUSES = ['new', 'open', 'won', 'lost']
+
 
 def db():
     if 'db' not in g:
@@ -79,6 +81,7 @@ def init_db():
     ensure_column(conn, 'leads', 'service_type', 'service_type TEXT')
     ensure_column(conn, 'leads', 'postcode', 'postcode TEXT')
     ensure_column(conn, 'leads', 'urgency', 'urgency TEXT')
+    ensure_column(conn, 'leads', 'notes', 'notes TEXT DEFAULT ""')
 
     conn.commit()
     conn.close()
@@ -130,6 +133,11 @@ def label_urgency(value):
     return mapping.get((value or '').strip(), value or '—')
 
 
+def safe_status(value):
+    value = (value or '').strip().lower()
+    return value if value in ALLOWED_STATUSES else 'new'
+
+
 BASE_HTML = '''
 <!doctype html>
 <html lang="en">
@@ -155,14 +163,9 @@ BASE_HTML = '''
       --max: 1180px;
     }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: linear-gradient(180deg, #f8fbff 0%, #f4f7fb 100%);
-      color: var(--ink);
-    }
-    a { color: var(--blue); text-decoration: none; }
-    .shell { max-width: var(--max); margin: 0 auto; padding: 28px 20px 40px; }
+    body { margin:0; font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:linear-gradient(180deg,#f8fbff 0%,#f4f7fb 100%); color:var(--ink); }
+    a { color:var(--blue); text-decoration:none; }
+    .shell { max-width:var(--max); margin:0 auto; padding:28px 20px 40px; }
     .topbar { display:flex; align-items:center; justify-content:space-between; gap:20px; margin-bottom:22px; flex-wrap:wrap; }
     .brand { display:flex; align-items:center; gap:12px; font-weight:800; letter-spacing:-0.02em; color:var(--ink); }
     .brand-mark { width:42px; height:42px; border-radius:14px; background:linear-gradient(135deg,var(--blue) 0%,#5ea1ff 100%); display:inline-flex; align-items:center; justify-content:center; color:#fff; box-shadow:0 10px 24px rgba(37,117,252,0.28); font-size:18px; font-weight:900; }
@@ -187,10 +190,11 @@ BASE_HTML = '''
     .stack { display:grid; gap:18px; }
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); padding:22px; }
     .panel-header { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; margin-bottom:18px; flex-wrap:wrap; }
-    .meta { display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }
+    .meta, .filters { display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }
     .pill { display:inline-flex; align-items:center; gap:8px; padding:9px 12px; border-radius:999px; font-size:13px; font-weight:700; background:var(--blue-soft); color:var(--blue-dark); border:1px solid rgba(37,117,252,.16); }
     .pill.neutral { background:#f6f8fb; color:#41506d; border-color:var(--line); }
     .pill.success { background:#ebfff4; color:#09814a; border-color:#ccefdc; }
+    .pill.filter-active { background:#1b5ed1; color:#fff; border-color:#1b5ed1; }
     .kpis { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }
     .kpi { padding:16px; border-radius:16px; background:#f9fbff; border:1px solid var(--line); transition:.18s ease; }
     .kpi:hover { transform:translateY(-2px); box-shadow:0 8px 20px rgba(17,36,77,.06); }
@@ -211,12 +215,18 @@ BASE_HTML = '''
     .action { display:inline-flex; align-items:center; justify-content:center; padding:10px 14px; border-radius:12px; border:1px solid rgba(37,117,252,.18); background:var(--blue-soft); color:var(--blue-dark); font-weight:700; transition:.16s ease; }
     .action:hover { transform:translateY(-1px); background:#dce9ff; }
     .empty { border:2px dashed var(--line); border-radius:18px; padding:28px; background:#fbfdff; text-align:center; }
-    .detail-grid { display:grid; grid-template-columns:1.15fr .85fr; gap:18px; }
+    .detail-grid { display:grid; grid-template-columns:1.05fr .95fr; gap:18px; }
     .info-list { display:grid; gap:12px; }
     .info-item { border:1px solid var(--line); border-radius:14px; padding:14px; background:#fbfdff; }
     .info-item .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; font-weight:800; margin-bottom:7px; }
-    .message-box,pre { background:#f8fbff; border:1px solid var(--line); border-radius:16px; padding:18px; color:#22304b; white-space:pre-wrap; word-break:break-word; }
+    .message-box, pre, textarea, select { font:inherit; }
+    .message-box, pre { background:#f8fbff; border:1px solid var(--line); border-radius:16px; padding:18px; color:#22304b; white-space:pre-wrap; word-break:break-word; }
     pre { margin:0; font-size:13px; line-height:1.55; overflow:auto; }
+    .admin-form label { display:block; margin:0 0 12px; font-size:13px; font-weight:700; color:#33425d; }
+    .admin-form select, .admin-form textarea { width:100%; padding:12px 13px; border:1px solid #dbe5f0; border-radius:12px; background:#fff; }
+    .admin-form textarea { min-height:140px; resize:vertical; }
+    .admin-form button { border:0; border-radius:12px; padding:12px 16px; font-weight:700; cursor:pointer; background:#2575fc; color:#fff; }
+    .notice-success { background:#ebfff4; border:1px solid #ccefdc; color:#0c8b51; padding:12px 14px; border-radius:14px; margin-bottom:14px; font-weight:700; }
     .footer-note { margin-top:18px; font-size:13px; color:var(--muted); text-align:center; }
     @media (max-width:960px){ .grid.stats,.kpis,.detail-grid{grid-template-columns:1fr;} }
     @media (max-width:720px){ .shell{padding:18px 14px 28px;} .hero,.panel{padding:18px;} table,thead,tbody,th,td,tr{display:block;} thead{display:none;} tbody tr{border:1px solid var(--line); border-radius:16px; padding:10px; margin-bottom:12px; background:#fff;} tbody td{border:0; padding:7px 6px;} tbody td:before{content:attr(data-label); display:block; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; font-weight:800; margin-bottom:6px;} }
@@ -232,7 +242,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.3 test dashboard · qualification flow and lead detail review</div>
+    <div class="footer-note">LeadResponse v0.4 test dashboard · lead admin, status updates and notes</div>
   </div>
 </body>
 </html>
@@ -272,6 +282,7 @@ def home():
 @app.route('/dashboard')
 def dashboard():
     site_token = (request.args.get('site_token') or '').strip()
+    status_filter = (request.args.get('status') or 'all').strip().lower()
     site = get_site_by_token(site_token) if site_token else get_default_site()
 
     if site and site['site_token'] and not site_token:
@@ -304,22 +315,31 @@ def dashboard():
         ''', sites=sites)
         return render_page(body, current_site=None)
 
-    lead_rows = db().execute('SELECT * FROM leads WHERE site_id = ? ORDER BY id DESC LIMIT 100', (site['id'],)).fetchall()
+    params = [site['id']]
+    query = 'SELECT * FROM leads WHERE site_id = ?'
+    if status_filter in ALLOWED_STATUSES:
+        query += ' AND status = ?'
+        params.append(status_filter)
+    query += ' ORDER BY id DESC LIMIT 100'
+    lead_rows = db().execute(query, params).fetchall()
+
     total_leads = db().execute('SELECT COUNT(*) AS c FROM leads WHERE site_id = ?', (site['id'],)).fetchone()['c']
     new_leads = db().execute("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'new'", (site['id'],)).fetchone()['c']
-    today_leads = db().execute("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND substr(created_at,1,10) = substr(?,1,10)", (site['id'], now_iso())).fetchone()['c']
+    open_leads = db().execute("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'open'", (site['id'],)).fetchone()['c']
+    won_leads = db().execute("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'won'", (site['id'],)).fetchone()['c']
+    lost_leads = db().execute("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'lost'", (site['id'],)).fetchone()['c']
     latest = lead_rows[0] if lead_rows else None
 
     body = render_template_string('''
     <section class="hero">
       <div class="eyebrow">Lead inbox · Site #{{ site['id'] }}</div>
       <h1>{{ site['name'] or 'Lead Inbox' }}</h1>
-      <p>Review new submissions, open individual lead records, and confirm that your WordPress plugin is sending data into the SaaS backend correctly.</p>
+      <p>Review new submissions, update statuses, add notes, and confirm that your WordPress plugin is sending data into the SaaS backend correctly.</p>
       <div class="grid stats">
         <div class="stat"><div class="label">Total Leads</div><div class="value">{{ total_leads }}</div></div>
         <div class="stat"><div class="label">New</div><div class="value">{{ new_leads }}</div></div>
-        <div class="stat"><div class="label">Today</div><div class="value">{{ today_leads }}</div></div>
-        <div class="stat"><div class="label">Widget</div><div class="value">{{ 'On' if site['widget_enabled'] else 'Off' }}</div></div>
+        <div class="stat"><div class="label">Open</div><div class="value">{{ open_leads }}</div></div>
+        <div class="stat"><div class="label">Won</div><div class="value">{{ won_leads }}</div></div>
       </div>
     </section>
 
@@ -336,6 +356,7 @@ def dashboard():
           <span class="pill neutral">Domain: {{ site['domain'] or 'Not provided' }}</span>
           <span class="pill neutral">Site token: {{ site['site_token'] or 'Missing' }}</span>
           <span class="pill neutral">Booking URL: {{ site['booking_url'] or 'Not set' }}</span>
+          <span class="pill neutral">Lost: {{ lost_leads }}</span>
         </div>
       </section>
 
@@ -344,6 +365,13 @@ def dashboard():
           <div>
             <h2>Lead inbox</h2>
             <p>Latest 100 leads received for this connected site.</p>
+            <div class="filters">
+              <a class="pill {% if status_filter == 'all' %}filter-active{% else %}neutral{% endif %}" href="{{ url_for('dashboard', site_token=site['site_token'], status='all') }}">All</a>
+              <a class="pill {% if status_filter == 'new' %}filter-active{% else %}neutral{% endif %}" href="{{ url_for('dashboard', site_token=site['site_token'], status='new') }}">New</a>
+              <a class="pill {% if status_filter == 'open' %}filter-active{% else %}neutral{% endif %}" href="{{ url_for('dashboard', site_token=site['site_token'], status='open') }}">Open</a>
+              <a class="pill {% if status_filter == 'won' %}filter-active{% else %}neutral{% endif %}" href="{{ url_for('dashboard', site_token=site['site_token'], status='won') }}">Won</a>
+              <a class="pill {% if status_filter == 'lost' %}filter-active{% else %}neutral{% endif %}" href="{{ url_for('dashboard', site_token=site['site_token'], status='lost') }}">Lost</a>
+            </div>
           </div>
           {% if latest %}
           <a class="action" href="{{ url_for('lead_detail_page', lead_id=latest['id'], site_token=site['site_token']) }}">Open latest lead</a>
@@ -358,6 +386,7 @@ def dashboard():
               <th>Qualification</th>
               <th>Message</th>
               <th>Status</th>
+              <th>Notes</th>
               <th>Received</th>
               <th></th>
             </tr>
@@ -376,8 +405,9 @@ def dashboard():
                 <div class="muted"><strong>Postcode:</strong> {{ lead['postcode'] or '—' }}</div>
                 <div class="muted"><strong>Urgency:</strong> {{ label_urgency(lead['urgency']) }}</div>
               </td>
-              <td data-label="Message">{{ (lead['message'] or '—')[:120] }}{% if lead['message'] and lead['message']|length > 120 %}…{% endif %}</td>
+              <td data-label="Message">{{ (lead['message'] or '—')[:100] }}{% if lead['message'] and lead['message']|length > 100 %}…{% endif %}</td>
               <td data-label="Status"><span class="badge badge-{{ lead['status'] if lead['status'] in ['new', 'open', 'won', 'lost'] else 'open' }}">{{ lead['status'] }}</span></td>
+              <td data-label="Notes">{{ (lead['notes'] or '—')[:70] }}{% if lead['notes'] and lead['notes']|length > 70 %}…{% endif %}</td>
               <td data-label="Received">{{ fmt_dt(lead['created_at']) }}</td>
               <td data-label="Open"><a class="action" href="{{ url_for('lead_detail_page', lead_id=lead['id'], site_token=site['site_token']) }}">View</a></td>
             </tr>
@@ -386,8 +416,8 @@ def dashboard():
         </table>
         {% else %}
         <div class="empty">
-          <h3>No leads yet</h3>
-          <p>Submit a test lead through the widget and it will appear here.</p>
+          <h3>No leads in this filter</h3>
+          <p>Try a different status filter or submit a new lead through the widget.</p>
         </div>
         {% endif %}
       </section>
@@ -410,7 +440,7 @@ def dashboard():
         </div>
       </section>
     </div>
-    ''', site=site, lead_rows=lead_rows, total_leads=total_leads, new_leads=new_leads, today_leads=today_leads, latest=latest, sites=sites, fmt_dt=fmt_dt, label_urgency=label_urgency)
+    ''', site=site, lead_rows=lead_rows, total_leads=total_leads, new_leads=new_leads, open_leads=open_leads, won_leads=won_leads, lost_leads=lost_leads, latest=latest, sites=sites, fmt_dt=fmt_dt, label_urgency=label_urgency, status_filter=status_filter)
 
     return render_page(body, title='LeadResponse Lead Inbox', current_site=site)
 
@@ -433,18 +463,23 @@ def lead_detail_page(lead_id):
 
     site = db().execute('SELECT * FROM sites WHERE id = ?', (lead['site_id'],)).fetchone()
     events = db().execute('SELECT * FROM lead_events WHERE lead_id = ? ORDER BY id DESC', (lead_id,)).fetchall()
+    updated_notice = (request.args.get('updated') or '') == '1'
 
     body = render_template_string('''
     <section class="hero">
       <div class="eyebrow">Lead detail · #{{ lead['id'] }}</div>
       <h1>{{ lead['first_name'] or 'Unknown lead' }}</h1>
-      <p>Review captured contact details, qualification answers, message content and the raw event payload for development testing.</p>
+      <p>Review captured contact details, qualification answers, notes and the raw event payload for development testing and admin handling.</p>
       <div class="meta">
         <span class="pill">Status: {{ lead['status'] }}</span>
         <span class="pill neutral">Source: {{ lead['source'] }}</span>
         <span class="pill neutral">Received: {{ fmt_dt(lead['created_at']) }}</span>
       </div>
     </section>
+
+    {% if updated_notice %}
+      <div class="notice-success">Lead updated successfully.</div>
+    {% endif %}
 
     <div class="detail-grid">
       <section class="panel">
@@ -467,6 +502,30 @@ def lead_detail_page(lead_id):
       </section>
 
       <div class="stack">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Lead admin</h2>
+              <p>Update the lead status and add internal notes.</p>
+            </div>
+          </div>
+          <form method="post" action="{{ url_for('lead_update_page', lead_id=lead['id']) }}?site_token={{ site['site_token'] if site else current_site['site_token'] if current_site else '' }}" class="admin-form">
+            <label>
+              Status
+              <select name="status">
+                {% for value in ['new', 'open', 'won', 'lost'] %}
+                  <option value="{{ value }}" {% if lead['status'] == value %}selected{% endif %}>{{ value.title() }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label>
+              Notes
+              <textarea name="notes" placeholder="Add internal notes for this lead...">{{ lead['notes'] or '' }}</textarea>
+            </label>
+            <button type="submit">Save lead</button>
+          </form>
+        </section>
+
         <section class="panel">
           <div class="panel-header">
             <div>
@@ -505,9 +564,35 @@ def lead_detail_page(lead_id):
         </section>
       </div>
     </div>
-    ''', lead=lead, site=site, current_site=current_site, events=events, fmt_dt=fmt_dt, parse_payload=parse_payload, label_urgency=label_urgency)
+    ''', lead=lead, site=site, current_site=current_site, events=events, fmt_dt=fmt_dt, parse_payload=parse_payload, label_urgency=label_urgency, updated_notice=updated_notice)
 
     return render_page(body, title=f"Lead #{lead['id']} · LeadResponse", current_site=site or current_site)
+
+
+@app.route('/dashboard/leads/<int:lead_id>/save', methods=['POST'])
+def lead_update_page(lead_id):
+    site_token = (request.args.get('site_token') or '').strip()
+    site = get_site_by_token(site_token)
+    if not site:
+        return redirect(url_for('dashboard'))
+
+    lead = db().execute('SELECT * FROM leads WHERE id = ? AND site_id = ?', (lead_id, site['id'])).fetchone()
+    if not lead:
+        return redirect(url_for('dashboard', site_token=site['site_token']))
+
+    status = safe_status(request.form.get('status'))
+    notes = (request.form.get('notes') or '').strip()
+    updated_at = now_iso()
+
+    conn = db()
+    conn.execute('UPDATE leads SET status = ?, notes = ? WHERE id = ?', (status, notes, lead_id))
+    conn.execute(
+        'INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)',
+        (site['id'], lead_id, 'lead_updated', json.dumps({'status': status, 'notes': notes}), updated_at)
+    )
+    conn.commit()
+
+    return redirect(url_for('lead_detail_page', lead_id=lead_id, site_token=site['site_token'], updated='1'))
 
 
 @app.route('/seed-demo')
@@ -549,12 +634,7 @@ def connect_site():
     )
     conn.commit()
 
-    return jsonify({
-        'site_id': site['id'],
-        'site_token': site_token,
-        'site_secret': site_secret,
-        'status': 'connected'
-    })
+    return jsonify({'site_id': site['id'], 'site_token': site_token, 'site_secret': site_secret, 'status': 'connected'})
 
 
 @app.route('/api/v1/sites/verify', methods=['POST'])
@@ -606,10 +686,9 @@ def lead_events():
     conn = db()
     cur = conn.cursor()
     cur.execute(
-        'INSERT INTO leads (site_id, source, first_name, email, phone, service_type, postcode, urgency, message, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO leads (site_id, source, first_name, email, phone, service_type, postcode, urgency, message, status, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (
-            site['id'],
-            source,
+            site['id'], source,
             (lead.get('first_name') or '').strip(),
             (lead.get('email') or '').strip(),
             (lead.get('phone') or '').strip(),
@@ -618,6 +697,7 @@ def lead_events():
             (lead.get('urgency') or '').strip(),
             (lead.get('message') or '').strip(),
             'new',
+            '',
             created_at,
         )
     )
@@ -643,11 +723,18 @@ def lead_events():
 @app.route('/api/v1/leads', methods=['GET'])
 def list_leads():
     site_token = (request.args.get('site_token') or '').strip()
+    status_filter = (request.args.get('status') or 'all').strip().lower()
     site = get_site_by_token(site_token)
     if not site:
         return jsonify({'error': 'Invalid site token.'}), 404
 
-    rows = db().execute('SELECT * FROM leads WHERE site_id = ? ORDER BY id DESC LIMIT 100', (site['id'],)).fetchall()
+    params = [site['id']]
+    query = 'SELECT * FROM leads WHERE site_id = ?'
+    if status_filter in ALLOWED_STATUSES:
+        query += ' AND status = ?'
+        params.append(status_filter)
+    query += ' ORDER BY id DESC LIMIT 100'
+    rows = db().execute(query, params).fetchall()
     return jsonify({'items': [row_to_dict(r) for r in rows]})
 
 
@@ -657,6 +744,34 @@ def get_lead(lead_id):
     if not row:
         return jsonify({'error': 'Lead not found.'}), 404
     return jsonify(row_to_dict(row))
+
+
+@app.route('/api/v1/leads/<int:lead_id>/update', methods=['POST'])
+def update_lead_api(lead_id):
+    payload = request.get_json(silent=True) or {}
+    site_token = (payload.get('site_token') or '').strip()
+    site = get_site_by_token(site_token)
+    if not site:
+        return jsonify({'error': 'Invalid site token.'}), 404
+
+    lead = db().execute('SELECT * FROM leads WHERE id = ? AND site_id = ?', (lead_id, site['id'])).fetchone()
+    if not lead:
+        return jsonify({'error': 'Lead not found.'}), 404
+
+    status = safe_status(payload.get('status') or lead['status'])
+    notes = (payload.get('notes') or '').strip()
+    updated_at = now_iso()
+
+    conn = db()
+    conn.execute('UPDATE leads SET status = ?, notes = ? WHERE id = ?', (status, notes, lead_id))
+    conn.execute(
+        'INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)',
+        (site['id'], lead_id, 'lead_updated', json.dumps({'status': status, 'notes': notes}), updated_at)
+    )
+    conn.commit()
+
+    updated = db().execute('SELECT * FROM leads WHERE id = ?', (lead_id,)).fetchone()
+    return jsonify({'success': True, 'item': row_to_dict(updated)})
 
 
 @app.route('/health')
