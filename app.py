@@ -26,6 +26,12 @@ def close_db(exception=None):
         conn.close()
 
 
+def ensure_column(conn, table_name, column_name, column_sql):
+    existing = {row[1] for row in conn.execute(f'PRAGMA table_info({table_name})').fetchall()}
+    if column_name not in existing:
+        conn.execute(f'ALTER TABLE {table_name} ADD COLUMN {column_sql}')
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -69,6 +75,11 @@ def init_db():
         FOREIGN KEY(lead_id) REFERENCES leads(id)
     );
     ''')
+
+    ensure_column(conn, 'leads', 'service_type', 'service_type TEXT')
+    ensure_column(conn, 'leads', 'postcode', 'postcode TEXT')
+    ensure_column(conn, 'leads', 'urgency', 'urgency TEXT')
+
     conn.commit()
     conn.close()
 
@@ -105,10 +116,18 @@ def parse_payload(payload_json):
     if not payload_json:
         return {}
     try:
-        data = json.loads(payload_json.replace("'", '"'))
-        return data if isinstance(data, dict) else {'raw': data}
+        return json.loads(payload_json)
     except Exception:
         return {'raw': payload_json}
+
+
+def label_urgency(value):
+    mapping = {
+        'asap': 'ASAP',
+        'this_week': 'This week',
+        'planning': 'Just planning'
+    }
+    return mapping.get((value or '').strip(), value or '—')
 
 
 BASE_HTML = '''
@@ -133,7 +152,6 @@ BASE_HTML = '''
       --red: #e05555;
       --shadow: 0 12px 32px rgba(17, 36, 77, 0.08);
       --radius: 18px;
-      --radius-sm: 12px;
       --max: 1180px;
     }
     * { box-sizing: border-box; }
@@ -144,296 +162,64 @@ BASE_HTML = '''
       color: var(--ink);
     }
     a { color: var(--blue); text-decoration: none; }
-    .shell {
-      max-width: var(--max);
-      margin: 0 auto;
-      padding: 28px 20px 40px;
-    }
-    .topbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 20px;
-      margin-bottom: 22px;
-      flex-wrap: wrap;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      font-weight: 800;
-      letter-spacing: -0.02em;
-      color: var(--ink);
-    }
-    .brand-mark {
-      width: 42px;
-      height: 42px;
-      border-radius: 14px;
-      background: linear-gradient(135deg, var(--blue) 0%, #5ea1ff 100%);
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      color: #fff;
-      box-shadow: 0 10px 24px rgba(37, 117, 252, 0.28);
-      font-size: 18px;
-      font-weight: 900;
-    }
-    .nav {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .nav a {
-      background: #fff;
-      border: 1px solid var(--line);
-      color: var(--ink);
-      padding: 10px 14px;
-      border-radius: 999px;
-      font-weight: 600;
-      transition: .18s ease;
-    }
-    .nav a:hover, .nav a.active {
-      transform: translateY(-1px);
-      border-color: rgba(37,117,252,.35);
-      background: var(--blue-soft);
-      color: var(--blue-dark);
-    }
-    .hero {
-      background: linear-gradient(135deg, #17233a 0%, #233a68 100%);
-      color: #fff;
-      border-radius: 26px;
-      padding: 28px;
-      box-shadow: var(--shadow);
-      position: relative;
-      overflow: hidden;
-      margin-bottom: 24px;
-    }
-    .hero:before {
-      content: '';
-      position: absolute;
-      inset: auto -60px -60px auto;
-      width: 220px;
-      height: 220px;
-      background: radial-gradient(circle, rgba(94,161,255,.35), rgba(94,161,255,0));
-    }
-    .eyebrow {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      background: rgba(255,255,255,.1);
-      border: 1px solid rgba(255,255,255,.14);
-      color: #dbe7ff;
-      border-radius: 999px;
-      padding: 8px 12px;
-      font-size: 13px;
-      font-weight: 700;
-      margin-bottom: 14px;
-    }
-    h1, h2, h3 { margin: 0 0 10px; letter-spacing: -0.03em; }
-    h1 { font-size: clamp(30px, 4vw, 44px); line-height: 1.05; }
-    h2 { font-size: clamp(24px, 3vw, 32px); }
-    h3 { font-size: 18px; }
-    p { margin: 0; color: var(--muted); line-height: 1.65; }
-    .hero p { color: rgba(255,255,255,.84); max-width: 760px; }
-    .grid { display: grid; gap: 18px; }
-    .grid.stats { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 22px; }
-    .stat {
-      background: rgba(255,255,255,.08);
-      border: 1px solid rgba(255,255,255,.10);
-      border-radius: 18px;
-      padding: 18px;
-      transition: .18s ease;
-    }
-    .stat:hover { transform: translateY(-2px); background: rgba(255,255,255,.11); }
-    .stat .label { color: rgba(255,255,255,.75); font-size: 13px; font-weight: 700; }
-    .stat .value { color: #fff; font-size: 28px; font-weight: 800; margin-top: 8px; }
-    .stack { display: grid; gap: 18px; }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      padding: 22px;
-    }
-    .panel-header {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 14px;
-      margin-bottom: 18px;
-      flex-wrap: wrap;
-    }
-    .meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 14px;
-    }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 9px 12px;
-      border-radius: 999px;
-      font-size: 13px;
-      font-weight: 700;
-      background: var(--blue-soft);
-      color: var(--blue-dark);
-      border: 1px solid rgba(37,117,252,.16);
-    }
-    .pill.neutral { background: #f6f8fb; color: #41506d; border-color: var(--line); }
-    .pill.success { background: #ebfff4; color: #09814a; border-color: #ccefdc; }
-    .kpis {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 14px;
-    }
-    .kpi {
-      padding: 16px;
-      border-radius: 16px;
-      background: #f9fbff;
-      border: 1px solid var(--line);
-      transition: .18s ease;
-    }
-    .kpi:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(17,36,77,.06); }
-    .kpi small { display:block; font-size: 12px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
-    .kpi strong { display:block; font-size: 24px; margin-top: 7px; }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-    thead th {
-      text-align: left;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: .05em;
-      color: var(--muted);
-      padding: 12px 10px;
-      border-bottom: 1px solid var(--line);
-    }
-    tbody td {
-      padding: 14px 10px;
-      border-bottom: 1px solid #edf2f8;
-      vertical-align: top;
-      color: #24314b;
-    }
-    tbody tr {
-      transition: .16s ease;
-    }
-    tbody tr:hover {
-      background: #fafcff;
-    }
-    .lead-name {
-      font-weight: 800;
-      color: var(--ink);
-      margin-bottom: 4px;
-    }
-    .muted { color: var(--muted); }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 6px 10px;
-      border-radius: 999px;
-      font-weight: 700;
-      font-size: 12px;
-      line-height: 1;
-      border: 1px solid transparent;
-      text-transform: capitalize;
-    }
-    .badge-new { background: #ebfff4; color: #0c8b51; border-color: #ccefdc; }
-    .badge-open { background: #fff5df; color: #996600; border-color: #f5dfb0; }
-    .badge-won { background: #eaf2ff; color: var(--blue-dark); border-color: #d5e3ff; }
-    .badge-lost { background: #fff0f0; color: #b33a3a; border-color: #f4d1d1; }
-    .action {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      padding: 10px 14px;
-      border-radius: 12px;
-      border: 1px solid rgba(37,117,252,.18);
-      background: var(--blue-soft);
-      color: var(--blue-dark);
-      font-weight: 700;
-      transition: .16s ease;
-    }
-    .action:hover { transform: translateY(-1px); background: #dce9ff; }
-    .empty {
-      border: 2px dashed var(--line);
-      border-radius: 18px;
-      padding: 28px;
-      background: #fbfdff;
-      text-align: center;
-    }
-    .detail-grid {
-      display: grid;
-      grid-template-columns: 1.15fr .85fr;
-      gap: 18px;
-    }
-    .info-list {
-      display: grid;
-      gap: 12px;
-    }
-    .info-item {
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 14px;
-      background: #fbfdff;
-    }
-    .info-item .label {
-      font-size: 12px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: .05em;
-      font-weight: 800;
-      margin-bottom: 7px;
-    }
-    .message-box, pre {
-      background: #f8fbff;
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 18px;
-      color: #22304b;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    pre { margin: 0; font-size: 13px; line-height: 1.55; overflow: auto; }
-    .footer-note {
-      margin-top: 18px;
-      font-size: 13px;
-      color: var(--muted);
-      text-align: center;
-    }
-    @media (max-width: 960px) {
-      .grid.stats, .kpis, .detail-grid { grid-template-columns: 1fr; }
-    }
-    @media (max-width: 720px) {
-      .shell { padding: 18px 14px 28px; }
-      .hero, .panel { padding: 18px; }
-      table, thead, tbody, th, td, tr { display: block; }
-      thead { display: none; }
-      tbody tr {
-        border: 1px solid var(--line);
-        border-radius: 16px;
-        padding: 10px;
-        margin-bottom: 12px;
-        background: #fff;
-      }
-      tbody td {
-        border: 0;
-        padding: 7px 6px;
-      }
-      tbody td:before {
-        content: attr(data-label);
-        display: block;
-        color: var(--muted);
-        font-size: 11px;
-        text-transform: uppercase;
-        letter-spacing: .05em;
-        font-weight: 800;
-        margin-bottom: 6px;
-      }
-    }
+    .shell { max-width: var(--max); margin: 0 auto; padding: 28px 20px 40px; }
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:20px; margin-bottom:22px; flex-wrap:wrap; }
+    .brand { display:flex; align-items:center; gap:12px; font-weight:800; letter-spacing:-0.02em; color:var(--ink); }
+    .brand-mark { width:42px; height:42px; border-radius:14px; background:linear-gradient(135deg,var(--blue) 0%,#5ea1ff 100%); display:inline-flex; align-items:center; justify-content:center; color:#fff; box-shadow:0 10px 24px rgba(37,117,252,0.28); font-size:18px; font-weight:900; }
+    .nav { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .nav a { background:#fff; border:1px solid var(--line); color:var(--ink); padding:10px 14px; border-radius:999px; font-weight:600; transition:.18s ease; }
+    .nav a:hover,.nav a.active { transform:translateY(-1px); border-color:rgba(37,117,252,.35); background:var(--blue-soft); color:var(--blue-dark); }
+    .hero { background:linear-gradient(135deg,#17233a 0%,#233a68 100%); color:#fff; border-radius:26px; padding:28px; box-shadow:var(--shadow); position:relative; overflow:hidden; margin-bottom:24px; }
+    .hero:before { content:''; position:absolute; inset:auto -60px -60px auto; width:220px; height:220px; background:radial-gradient(circle,rgba(94,161,255,.35),rgba(94,161,255,0)); }
+    .eyebrow { display:inline-flex; align-items:center; gap:8px; background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.14); color:#dbe7ff; border-radius:999px; padding:8px 12px; font-size:13px; font-weight:700; margin-bottom:14px; }
+    h1,h2,h3 { margin:0 0 10px; letter-spacing:-0.03em; }
+    h1 { font-size:clamp(30px,4vw,44px); line-height:1.05; }
+    h2 { font-size:clamp(24px,3vw,32px); }
+    h3 { font-size:18px; }
+    p { margin:0; color:var(--muted); line-height:1.65; }
+    .hero p { color:rgba(255,255,255,.84); max-width:760px; }
+    .grid { display:grid; gap:18px; }
+    .grid.stats { grid-template-columns:repeat(4,minmax(0,1fr)); margin-top:22px; }
+    .stat { background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.10); border-radius:18px; padding:18px; transition:.18s ease; }
+    .stat:hover { transform:translateY(-2px); background:rgba(255,255,255,.11); }
+    .stat .label { color:rgba(255,255,255,.75); font-size:13px; font-weight:700; }
+    .stat .value { color:#fff; font-size:28px; font-weight:800; margin-top:8px; }
+    .stack { display:grid; gap:18px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); padding:22px; }
+    .panel-header { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; margin-bottom:18px; flex-wrap:wrap; }
+    .meta { display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }
+    .pill { display:inline-flex; align-items:center; gap:8px; padding:9px 12px; border-radius:999px; font-size:13px; font-weight:700; background:var(--blue-soft); color:var(--blue-dark); border:1px solid rgba(37,117,252,.16); }
+    .pill.neutral { background:#f6f8fb; color:#41506d; border-color:var(--line); }
+    .pill.success { background:#ebfff4; color:#09814a; border-color:#ccefdc; }
+    .kpis { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }
+    .kpi { padding:16px; border-radius:16px; background:#f9fbff; border:1px solid var(--line); transition:.18s ease; }
+    .kpi:hover { transform:translateY(-2px); box-shadow:0 8px 20px rgba(17,36,77,.06); }
+    .kpi small { display:block; font-size:12px; color:var(--muted); font-weight:700; text-transform:uppercase; letter-spacing:.05em; }
+    .kpi strong { display:block; font-size:24px; margin-top:7px; }
+    table { width:100%; border-collapse:collapse; }
+    thead th { text-align:left; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); padding:12px 10px; border-bottom:1px solid var(--line); }
+    tbody td { padding:14px 10px; border-bottom:1px solid #edf2f8; vertical-align:top; color:#24314b; }
+    tbody tr { transition:.16s ease; }
+    tbody tr:hover { background:#fafcff; }
+    .lead-name { font-weight:800; color:var(--ink); margin-bottom:4px; }
+    .muted { color:var(--muted); }
+    .badge { display:inline-flex; align-items:center; padding:6px 10px; border-radius:999px; font-weight:700; font-size:12px; line-height:1; border:1px solid transparent; text-transform:capitalize; }
+    .badge-new { background:#ebfff4; color:#0c8b51; border-color:#ccefdc; }
+    .badge-open { background:#fff5df; color:#996600; border-color:#f5dfb0; }
+    .badge-won { background:#eaf2ff; color:var(--blue-dark); border-color:#d5e3ff; }
+    .badge-lost { background:#fff0f0; color:#b33a3a; border-color:#f4d1d1; }
+    .action { display:inline-flex; align-items:center; justify-content:center; padding:10px 14px; border-radius:12px; border:1px solid rgba(37,117,252,.18); background:var(--blue-soft); color:var(--blue-dark); font-weight:700; transition:.16s ease; }
+    .action:hover { transform:translateY(-1px); background:#dce9ff; }
+    .empty { border:2px dashed var(--line); border-radius:18px; padding:28px; background:#fbfdff; text-align:center; }
+    .detail-grid { display:grid; grid-template-columns:1.15fr .85fr; gap:18px; }
+    .info-list { display:grid; gap:12px; }
+    .info-item { border:1px solid var(--line); border-radius:14px; padding:14px; background:#fbfdff; }
+    .info-item .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; font-weight:800; margin-bottom:7px; }
+    .message-box,pre { background:#f8fbff; border:1px solid var(--line); border-radius:16px; padding:18px; color:#22304b; white-space:pre-wrap; word-break:break-word; }
+    pre { margin:0; font-size:13px; line-height:1.55; overflow:auto; }
+    .footer-note { margin-top:18px; font-size:13px; color:var(--muted); text-align:center; }
+    @media (max-width:960px){ .grid.stats,.kpis,.detail-grid{grid-template-columns:1fr;} }
+    @media (max-width:720px){ .shell{padding:18px 14px 28px;} .hero,.panel{padding:18px;} table,thead,tbody,th,td,tr{display:block;} thead{display:none;} tbody tr{border:1px solid var(--line); border-radius:16px; padding:10px; margin-bottom:12px; background:#fff;} tbody td{border:0; padding:7px 6px;} tbody td:before{content:attr(data-label); display:block; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; font-weight:800; margin-bottom:6px;} }
   </style>
 </head>
 <body>
@@ -446,7 +232,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.2 test dashboard · built for inbox and lead detail review</div>
+    <div class="footer-note">LeadResponse v0.3 test dashboard · qualification flow and lead detail review</div>
   </div>
 </body>
 </html>
@@ -569,7 +355,7 @@ def dashboard():
           <thead>
             <tr>
               <th>Lead</th>
-              <th>Contact</th>
+              <th>Qualification</th>
               <th>Message</th>
               <th>Status</th>
               <th>Received</th>
@@ -582,10 +368,13 @@ def dashboard():
               <td data-label="Lead">
                 <div class="lead-name">{{ lead['first_name'] or 'Unknown lead' }}</div>
                 <div class="muted">#{{ lead['id'] }} · {{ lead['source'] }}</div>
-              </td>
-              <td data-label="Contact">
-                <div>{{ lead['email'] or '—' }}</div>
+                <div class="muted">{{ lead['email'] or '—' }}</div>
                 <div class="muted">{{ lead['phone'] or '—' }}</div>
+              </td>
+              <td data-label="Qualification">
+                <div><strong>Service:</strong> {{ lead['service_type'] or '—' }}</div>
+                <div class="muted"><strong>Postcode:</strong> {{ lead['postcode'] or '—' }}</div>
+                <div class="muted"><strong>Urgency:</strong> {{ label_urgency(lead['urgency']) }}</div>
               </td>
               <td data-label="Message">{{ (lead['message'] or '—')[:120] }}{% if lead['message'] and lead['message']|length > 120 %}…{% endif %}</td>
               <td data-label="Status"><span class="badge badge-{{ lead['status'] if lead['status'] in ['new', 'open', 'won', 'lost'] else 'open' }}">{{ lead['status'] }}</span></td>
@@ -621,7 +410,7 @@ def dashboard():
         </div>
       </section>
     </div>
-    ''', site=site, lead_rows=lead_rows, total_leads=total_leads, new_leads=new_leads, today_leads=today_leads, latest=latest, sites=sites, fmt_dt=fmt_dt)
+    ''', site=site, lead_rows=lead_rows, total_leads=total_leads, new_leads=new_leads, today_leads=today_leads, latest=latest, sites=sites, fmt_dt=fmt_dt, label_urgency=label_urgency)
 
     return render_page(body, title='LeadResponse Lead Inbox', current_site=site)
 
@@ -649,7 +438,7 @@ def lead_detail_page(lead_id):
     <section class="hero">
       <div class="eyebrow">Lead detail · #{{ lead['id'] }}</div>
       <h1>{{ lead['first_name'] or 'Unknown lead' }}</h1>
-      <p>Review the captured contact details, original message, linked site record and raw event payload for testing and development.</p>
+      <p>Review captured contact details, qualification answers, message content and the raw event payload for development testing.</p>
       <div class="meta">
         <span class="pill">Status: {{ lead['status'] }}</span>
         <span class="pill neutral">Source: {{ lead['source'] }}</span>
@@ -670,6 +459,9 @@ def lead_detail_page(lead_id):
           <div class="info-item"><div class="label">First name</div><div>{{ lead['first_name'] or '—' }}</div></div>
           <div class="info-item"><div class="label">Email</div><div>{{ lead['email'] or '—' }}</div></div>
           <div class="info-item"><div class="label">Phone</div><div>{{ lead['phone'] or '—' }}</div></div>
+          <div class="info-item"><div class="label">Service type</div><div>{{ lead['service_type'] or '—' }}</div></div>
+          <div class="info-item"><div class="label">Postcode</div><div>{{ lead['postcode'] or '—' }}</div></div>
+          <div class="info-item"><div class="label">Urgency</div><div>{{ label_urgency(lead['urgency']) }}</div></div>
           <div class="info-item"><div class="label">Message</div><div class="message-box">{{ lead['message'] or '—' }}</div></div>
         </div>
       </section>
@@ -713,7 +505,7 @@ def lead_detail_page(lead_id):
         </section>
       </div>
     </div>
-    ''', lead=lead, site=site, current_site=current_site, events=events, fmt_dt=fmt_dt, parse_payload=parse_payload)
+    ''', lead=lead, site=site, current_site=current_site, events=events, fmt_dt=fmt_dt, parse_payload=parse_payload, label_urgency=label_urgency)
 
     return render_page(body, title=f"Lead #{lead['id']} · LeadResponse", current_site=site or current_site)
 
@@ -814,13 +606,16 @@ def lead_events():
     conn = db()
     cur = conn.cursor()
     cur.execute(
-        'INSERT INTO leads (site_id, source, first_name, email, phone, message, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO leads (site_id, source, first_name, email, phone, service_type, postcode, urgency, message, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (
             site['id'],
             source,
             (lead.get('first_name') or '').strip(),
             (lead.get('email') or '').strip(),
             (lead.get('phone') or '').strip(),
+            (lead.get('service_type') or '').strip(),
+            (lead.get('postcode') or '').strip(),
+            (lead.get('urgency') or '').strip(),
             (lead.get('message') or '').strip(),
             'new',
             created_at,
