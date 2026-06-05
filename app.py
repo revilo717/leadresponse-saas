@@ -1,12 +1,20 @@
 from flask import Flask, request, jsonify, g, render_template_string, redirect, url_for
+import os
 import sqlite3
 import secrets
 import json
 from pathlib import Path
 from datetime import datetime, timezone
 
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except Exception:
+    psycopg2 = None
+    RealDictCursor = None
+
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / 'leadresponse.sqlite'
+DEFAULT_SQLITE_PATH = BASE_DIR / 'leadresponse.sqlite'
 
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
@@ -14,10 +22,78 @@ app.config['JSON_SORT_KEYS'] = False
 ALLOWED_STATUSES = ['new', 'open', 'won', 'lost']
 
 
+class DBConnection:
+    def __init__(self, conn, backend):
+        self.conn = conn
+        self.backend = backend
+
+    def execute(self, query, params=()):
+        cursor = self.cursor()
+        cursor.execute(query, params)
+        return cursor
+
+    def cursor(self):
+        if self.backend == 'postgres':
+            return self.conn.cursor(cursor_factory=RealDictCursor)
+        return self.conn.cursor()
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
+
+    def close(self):
+        self.conn.close()
+
+
+def get_database_url():
+    value = (os.getenv('DATABASE_URL') or '').strip()
+    if value:
+        return value
+    return f'sqlite:///{DEFAULT_SQLITE_PATH}'
+
+
+def normalized_database_url():
+    url = get_database_url()
+    if url.startswith('postgres://'):
+        return 'postgresql://' + url[len('postgres://'):]
+    return url
+
+
+def get_db_backend():
+    return 'postgres' if normalized_database_url().startswith('postgresql://') else 'sqlite'
+
+
+def sqlite_db_path():
+    url = normalized_database_url()
+    if url.startswith('sqlite:///'):
+        return Path(url.replace('sqlite:///', '', 1))
+    return DEFAULT_SQLITE_PATH
+
+
+def sql(query):
+    return query.replace('?', '%s') if get_db_backend() == 'postgres' else query
+
+
+def connect_db():
+    backend = get_db_backend()
+    if backend == 'postgres':
+        if psycopg2 is None:
+            raise RuntimeError('psycopg2-binary is required when DATABASE_URL points to Postgres.')
+        conn = psycopg2.connect(normalized_database_url())
+        return DBConnection(conn, backend)
+
+    db_path = sqlite_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return DBConnection(conn, backend)
+
+
 def db():
     if 'db' not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
+        g.db = connect_db()
     return g.db
 
 
@@ -29,59 +105,106 @@ def close_db(exception=None):
 
 
 def ensure_column(conn, table_name, column_name, column_sql):
+    if get_db_backend() == 'postgres':
+        conn.execute(f'ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_sql}')
+        return
+
     existing = {row[1] for row in conn.execute(f'PRAGMA table_info({table_name})').fetchall()}
     if column_name not in existing:
         conn.execute(f'ALTER TABLE {table_name} ADD COLUMN {column_sql}')
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.executescript('''
-    CREATE TABLE IF NOT EXISTS sites (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        domain TEXT,
-        connect_token TEXT UNIQUE NOT NULL,
-        site_token TEXT UNIQUE,
-        site_secret TEXT,
-        status TEXT NOT NULL DEFAULT 'pending',
-        booking_url TEXT,
-        widget_enabled INTEGER NOT NULL DEFAULT 1,
-        welcome_message TEXT DEFAULT 'Hi, tell us a little about your job and we will get back to you quickly.',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    );
+    conn = connect_db()
 
-    CREATE TABLE IF NOT EXISTS leads (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        site_id INTEGER NOT NULL,
-        source TEXT NOT NULL,
-        first_name TEXT,
-        email TEXT,
-        phone TEXT,
-        message TEXT,
-        status TEXT NOT NULL DEFAULT 'new',
-        created_at TEXT NOT NULL,
-        FOREIGN KEY(site_id) REFERENCES sites(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS lead_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        site_id INTEGER NOT NULL,
-        lead_id INTEGER,
-        event_type TEXT NOT NULL,
-        payload_json TEXT,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY(site_id) REFERENCES sites(id),
-        FOREIGN KEY(lead_id) REFERENCES leads(id)
-    );
-    ''')
+    if get_db_backend() == 'postgres':
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS sites (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            domain TEXT,
+            connect_token TEXT UNIQUE NOT NULL,
+            site_token TEXT UNIQUE,
+            site_secret TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            booking_url TEXT,
+            widget_enabled INTEGER NOT NULL DEFAULT 1,
+            welcome_message TEXT DEFAULT 'Hi, tell us a little about your job and we will get back to you quickly.',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        ''')
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS leads (
+            id BIGSERIAL PRIMARY KEY,
+            site_id BIGINT NOT NULL REFERENCES sites(id),
+            source TEXT NOT NULL,
+            first_name TEXT,
+            email TEXT,
+            phone TEXT,
+            message TEXT,
+            status TEXT NOT NULL DEFAULT 'new',
+            created_at TEXT NOT NULL
+        )
+        ''')
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS lead_events (
+            id BIGSERIAL PRIMARY KEY,
+            site_id BIGINT NOT NULL REFERENCES sites(id),
+            lead_id BIGINT REFERENCES leads(id),
+            event_type TEXT NOT NULL,
+            payload_json TEXT,
+            created_at TEXT NOT NULL
+        )
+        ''')
+    else:
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS sites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            domain TEXT,
+            connect_token TEXT UNIQUE NOT NULL,
+            site_token TEXT UNIQUE,
+            site_secret TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            booking_url TEXT,
+            widget_enabled INTEGER NOT NULL DEFAULT 1,
+            welcome_message TEXT DEFAULT 'Hi, tell us a little about your job and we will get back to you quickly.',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        ''')
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            first_name TEXT,
+            email TEXT,
+            phone TEXT,
+            message TEXT,
+            status TEXT NOT NULL DEFAULT 'new',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(site_id) REFERENCES sites(id)
+        )
+        ''')
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS lead_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_id INTEGER NOT NULL,
+            lead_id INTEGER,
+            event_type TEXT NOT NULL,
+            payload_json TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(site_id) REFERENCES sites(id),
+            FOREIGN KEY(lead_id) REFERENCES leads(id)
+        )
+        ''')
 
     ensure_column(conn, 'leads', 'service_type', 'service_type TEXT')
     ensure_column(conn, 'leads', 'postcode', 'postcode TEXT')
     ensure_column(conn, 'leads', 'urgency', 'urgency TEXT')
-    ensure_column(conn, 'leads', 'notes', 'notes TEXT DEFAULT ""')
+    ensure_column(conn, 'leads', 'notes', "notes TEXT DEFAULT ''")
 
     conn.commit()
     conn.close()
@@ -92,17 +215,24 @@ def now_iso():
 
 
 def row_to_dict(row):
-    return {key: row[key] for key in row.keys()}
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return dict(row)
+    try:
+        return {key: row[key] for key in row.keys()}
+    except Exception:
+        return dict(row)
 
 
 def get_site_by_token(site_token):
-    return db().execute('SELECT * FROM sites WHERE site_token = ?', (site_token,)).fetchone()
+    return db().execute(sql('SELECT * FROM sites WHERE site_token = ?'), (site_token,)).fetchone()
 
 
 def get_default_site():
     return db().execute(
-        "SELECT * FROM sites WHERE status = 'connected' ORDER BY id ASC LIMIT 1"
-    ).fetchone() or db().execute('SELECT * FROM sites ORDER BY id ASC LIMIT 1').fetchone()
+        sql("SELECT * FROM sites WHERE status = 'connected' ORDER BY id ASC LIMIT 1")
+    ).fetchone() or db().execute(sql('SELECT * FROM sites ORDER BY id ASC LIMIT 1')).fetchone()
 
 
 def fmt_dt(value):
@@ -242,7 +372,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.4 test dashboard · lead admin, status updates and notes</div>
+    <div class="footer-note">LeadResponse v0.6 test dashboard · Render Postgres ready</div>
   </div>
 </body>
 </html>
@@ -288,7 +418,7 @@ def dashboard():
     if site and site['site_token'] and not site_token:
         return redirect(url_for('dashboard', site_token=site['site_token']))
 
-    sites = db().execute('SELECT * FROM sites ORDER BY id ASC').fetchall()
+    sites = db().execute(sql('SELECT * FROM sites ORDER BY id ASC')).fetchall()
 
     if not site:
         body = render_template_string('''
@@ -321,13 +451,13 @@ def dashboard():
         query += ' AND status = ?'
         params.append(status_filter)
     query += ' ORDER BY id DESC LIMIT 100'
-    lead_rows = db().execute(query, params).fetchall()
+    lead_rows = db().execute(sql(query), params).fetchall()
 
-    total_leads = db().execute('SELECT COUNT(*) AS c FROM leads WHERE site_id = ?', (site['id'],)).fetchone()['c']
-    new_leads = db().execute("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'new'", (site['id'],)).fetchone()['c']
-    open_leads = db().execute("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'open'", (site['id'],)).fetchone()['c']
-    won_leads = db().execute("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'won'", (site['id'],)).fetchone()['c']
-    lost_leads = db().execute("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'lost'", (site['id'],)).fetchone()['c']
+    total_leads = db().execute(sql('SELECT COUNT(*) AS c FROM leads WHERE site_id = ?'), (site['id'],)).fetchone()['c']
+    new_leads = db().execute(sql("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'new'"), (site['id'],)).fetchone()['c']
+    open_leads = db().execute(sql("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'open'"), (site['id'],)).fetchone()['c']
+    won_leads = db().execute(sql("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'won'"), (site['id'],)).fetchone()['c']
+    lost_leads = db().execute(sql("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'lost'"), (site['id'],)).fetchone()['c']
     latest = lead_rows[0] if lead_rows else None
 
     body = render_template_string('''
@@ -450,7 +580,7 @@ def lead_detail_page(lead_id):
     site_token = (request.args.get('site_token') or '').strip()
     current_site = get_site_by_token(site_token) if site_token else get_default_site()
 
-    lead = db().execute('SELECT * FROM leads WHERE id = ?', (lead_id,)).fetchone()
+    lead = db().execute(sql('SELECT * FROM leads WHERE id = ?'), (lead_id,)).fetchone()
     if not lead:
         body = render_template_string('''
         <section class="panel">
@@ -461,8 +591,8 @@ def lead_detail_page(lead_id):
         ''', back_url=url_for('dashboard', site_token=current_site['site_token']) if current_site and current_site['site_token'] else url_for('dashboard'))
         return render_page(body, title='Lead not found', current_site=current_site)
 
-    site = db().execute('SELECT * FROM sites WHERE id = ?', (lead['site_id'],)).fetchone()
-    events = db().execute('SELECT * FROM lead_events WHERE lead_id = ? ORDER BY id DESC', (lead_id,)).fetchall()
+    site = db().execute(sql('SELECT * FROM sites WHERE id = ?'), (lead['site_id'],)).fetchone()
+    events = db().execute(sql('SELECT * FROM lead_events WHERE lead_id = ? ORDER BY id DESC'), (lead_id,)).fetchall()
     updated_notice = (request.args.get('updated') or '') == '1'
 
     body = render_template_string('''
@@ -576,7 +706,7 @@ def lead_update_page(lead_id):
     if not site:
         return redirect(url_for('dashboard'))
 
-    lead = db().execute('SELECT * FROM leads WHERE id = ? AND site_id = ?', (lead_id, site['id'])).fetchone()
+    lead = db().execute(sql('SELECT * FROM leads WHERE id = ? AND site_id = ?'), (lead_id, site['id'])).fetchone()
     if not lead:
         return redirect(url_for('dashboard', site_token=site['site_token']))
 
@@ -585,9 +715,9 @@ def lead_update_page(lead_id):
     updated_at = now_iso()
 
     conn = db()
-    conn.execute('UPDATE leads SET status = ?, notes = ? WHERE id = ?', (status, notes, lead_id))
+    conn.execute(sql('UPDATE leads SET status = ?, notes = ? WHERE id = ?'), (status, notes, lead_id))
     conn.execute(
-        'INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)',
+        sql('INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)'),
         (site['id'], lead_id, 'lead_updated', json.dumps({'status': status, 'notes': notes}), updated_at)
     )
     conn.commit()
@@ -599,11 +729,11 @@ def lead_update_page(lead_id):
 def seed_demo():
     token = 'connect_demo_12345'
     conn = db()
-    site = conn.execute('SELECT * FROM sites WHERE connect_token = ?', (token,)).fetchone()
+    site = conn.execute(sql('SELECT * FROM sites WHERE connect_token = ?'), (token,)).fetchone()
     if not site:
         now = now_iso()
         conn.execute(
-            'INSERT INTO sites (name, connect_token, booking_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+            sql('INSERT INTO sites (name, connect_token, booking_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?)'),
             ('Demo Site', token, 'https://leadresponse.co.uk/contact/', now, now)
         )
         conn.commit()
@@ -620,7 +750,7 @@ def connect_site():
         return jsonify({'error': 'Missing connect token.'}), 400
 
     conn = db()
-    site = conn.execute('SELECT * FROM sites WHERE connect_token = ?', (connect_token,)).fetchone()
+    site = conn.execute(sql('SELECT * FROM sites WHERE connect_token = ?'), (connect_token,)).fetchone()
     if not site:
         return jsonify({'error': 'Invalid connect token.'}), 404
 
@@ -629,7 +759,7 @@ def connect_site():
     updated_at = now_iso()
 
     conn.execute(
-        'UPDATE sites SET domain = ?, site_token = ?, site_secret = ?, status = ?, updated_at = ? WHERE id = ?',
+        sql('UPDATE sites SET domain = ?, site_token = ?, site_secret = ?, status = ?, updated_at = ? WHERE id = ?'),
         (domain, site_token, site_secret, 'connected', updated_at, site['id'])
     )
     conn.commit()
@@ -684,26 +814,36 @@ def lead_events():
 
     created_at = now_iso()
     conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        'INSERT INTO leads (site_id, source, first_name, email, phone, service_type, postcode, urgency, message, status, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (
-            site['id'], source,
-            (lead.get('first_name') or '').strip(),
-            (lead.get('email') or '').strip(),
-            (lead.get('phone') or '').strip(),
-            (lead.get('service_type') or '').strip(),
-            (lead.get('postcode') or '').strip(),
-            (lead.get('urgency') or '').strip(),
-            (lead.get('message') or '').strip(),
-            'new',
-            '',
-            created_at,
-        )
+    lead_values = (
+        site['id'], source,
+        (lead.get('first_name') or '').strip(),
+        (lead.get('email') or '').strip(),
+        (lead.get('phone') or '').strip(),
+        (lead.get('service_type') or '').strip(),
+        (lead.get('postcode') or '').strip(),
+        (lead.get('urgency') or '').strip(),
+        (lead.get('message') or '').strip(),
+        'new',
+        '',
+        created_at,
     )
-    lead_id = cur.lastrowid
-    cur.execute(
-        'INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)',
+    if get_db_backend() == 'postgres':
+        cur = conn.cursor()
+        cur.execute(
+            sql('INSERT INTO leads (site_id, source, first_name, email, phone, service_type, postcode, urgency, message, status, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id'),
+            lead_values,
+        )
+        inserted = cur.fetchone()
+        lead_id = inserted['id'] if isinstance(inserted, dict) else inserted[0]
+    else:
+        cur = conn.cursor()
+        cur.execute(
+            sql('INSERT INTO leads (site_id, source, first_name, email, phone, service_type, postcode, urgency, message, status, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+            lead_values,
+        )
+        lead_id = cur.lastrowid
+    conn.execute(
+        sql(sql('INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)')),
         (site['id'], lead_id, payload.get('event_type') or 'lead_created', json.dumps(payload), created_at)
     )
     conn.commit()
@@ -734,13 +874,13 @@ def list_leads():
         query += ' AND status = ?'
         params.append(status_filter)
     query += ' ORDER BY id DESC LIMIT 100'
-    rows = db().execute(query, params).fetchall()
+    rows = db().execute(sql(query), params).fetchall()
     return jsonify({'items': [row_to_dict(r) for r in rows]})
 
 
 @app.route('/api/v1/leads/<int:lead_id>', methods=['GET'])
 def get_lead(lead_id):
-    row = db().execute('SELECT * FROM leads WHERE id = ?', (lead_id,)).fetchone()
+    row = db().execute(sql('SELECT * FROM leads WHERE id = ?'), (lead_id,)).fetchone()
     if not row:
         return jsonify({'error': 'Lead not found.'}), 404
     return jsonify(row_to_dict(row))
@@ -754,7 +894,7 @@ def update_lead_api(lead_id):
     if not site:
         return jsonify({'error': 'Invalid site token.'}), 404
 
-    lead = db().execute('SELECT * FROM leads WHERE id = ? AND site_id = ?', (lead_id, site['id'])).fetchone()
+    lead = db().execute(sql('SELECT * FROM leads WHERE id = ? AND site_id = ?'), (lead_id, site['id'])).fetchone()
     if not lead:
         return jsonify({'error': 'Lead not found.'}), 404
 
@@ -763,20 +903,20 @@ def update_lead_api(lead_id):
     updated_at = now_iso()
 
     conn = db()
-    conn.execute('UPDATE leads SET status = ?, notes = ? WHERE id = ?', (status, notes, lead_id))
+    conn.execute(sql('UPDATE leads SET status = ?, notes = ? WHERE id = ?'), (status, notes, lead_id))
     conn.execute(
-        'INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)',
+        sql('INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)'),
         (site['id'], lead_id, 'lead_updated', json.dumps({'status': status, 'notes': notes}), updated_at)
     )
     conn.commit()
 
-    updated = db().execute('SELECT * FROM leads WHERE id = ?', (lead_id,)).fetchone()
+    updated = db().execute(sql('SELECT * FROM leads WHERE id = ?'), (lead_id,)).fetchone()
     return jsonify({'success': True, 'item': row_to_dict(updated)})
 
 
 @app.route('/health')
 def health():
-    return jsonify({'ok': True, 'time': now_iso()})
+    return jsonify({'ok': True, 'time': now_iso(), 'db_backend': get_db_backend()})
 
 
 init_db()
