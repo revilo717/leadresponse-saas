@@ -87,6 +87,8 @@ WHITE_LABEL_DEFAULTS = {
     'email_subdomain': 'em',
     'email_domain_status': 'not_started',
     'dns_last_checked_at': '',
+    'email_from_localpart': 'hello',
+    'reply_to_email': '',
 }
 
 WHITE_LABEL_STATUS_VALUES = {'not_started', 'pending', 'verified', 'failed'}
@@ -311,6 +313,8 @@ def init_db():
         'email_subdomain': "email_subdomain TEXT DEFAULT 'em'",
         'email_domain_status': "email_domain_status TEXT DEFAULT 'not_started'",
         'dns_last_checked_at': "dns_last_checked_at TEXT",
+        'email_from_localpart': "email_from_localpart TEXT DEFAULT 'hello'",
+        'reply_to_email': "reply_to_email TEXT",
     }
     for column_name, column_sql in site_columns.items():
         ensure_column(conn, 'sites', column_name, column_sql)
@@ -386,10 +390,21 @@ def get_white_label_settings(site):
     settings['site_domain'] = parse_site_hostname(site_data.get('domain') or '')
     settings['portal_subdomain'] = (settings.get('portal_subdomain') or 'go').strip().lower()
     settings['email_subdomain'] = (settings.get('email_subdomain') or 'em').strip().lower()
+    settings['email_from_localpart'] = (settings.get('email_from_localpart') or 'hello').strip().lower()
+    settings['reply_to_email'] = (settings.get('reply_to_email') or '').strip()
     settings['portal_domain'] = f"{settings['portal_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
     settings['email_domain'] = f"{settings['email_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
     settings['portal_cname_target'] = (os.getenv('WHITE_LABEL_PORTAL_TARGET') or 'leadresponse-saas.onrender.com').strip()
-    settings['mail_from_name'] = settings['brand_display_name']
+    settings['platform_from_email'] = (os.getenv('MAIL_FROM') or os.getenv('SMTP_USERNAME') or 'no-reply@leadresponse.local').strip()
+    settings['platform_from_name'] = (os.getenv('MAIL_FROM_NAME') or 'LeadResponse').strip()
+    settings['branded_sender_email'] = f"{settings['email_from_localpart']}@{settings['email_domain']}" if settings['email_domain'] else ''
+    branded_ready = settings['white_label_enabled'] and settings['email_domain_status'] == 'verified' and bool(settings['branded_sender_email'])
+    settings['delivery_mode'] = 'branded_domain' if branded_ready else 'platform_domain'
+    settings['active_from_email'] = settings['branded_sender_email'] if branded_ready else settings['platform_from_email']
+    settings['active_from_name'] = settings['brand_display_name'] if branded_ready else settings['platform_from_name']
+    settings['mail_from_name'] = settings['active_from_name']
+    settings['tracking_cname_host'] = f"email.{settings['email_subdomain']}" if settings['email_subdomain'] else 'email.em'
+    settings['tracking_cname_value'] = 'mailgun.org'
     settings['portal_dns_record'] = {
         'host': settings['portal_subdomain'],
         'type': 'CNAME',
@@ -397,11 +412,25 @@ def get_white_label_settings(site):
         'priority': ''
     }
     settings['email_dns_steps'] = [
-        f"Create the sending subdomain {settings['email_domain'] or '[email-subdomain].[client-domain]' } in your email provider.",
-        "Add the SPF, DKIM, tracking CNAME, and MX records issued by the email provider for that sending subdomain.",
-        "Leave live sending on the platform domain until the branded email domain is verified."
+        f"Create the branded sending subdomain {settings['email_domain'] or '[email-subdomain].[client-domain]'} in your email provider.",
+        f"Expected sender after verification: {settings['branded_sender_email'] or '[localpart]@[email-subdomain].[client-domain]'}.",
+        f"Add the tracking CNAME {settings['tracking_cname_host']} -> {settings['tracking_cname_value']} together with the SPF, DKIM, and MX records issued by the email provider.",
+        "Until the email domain is verified, acknowledgements and follow-ups continue to send from the platform domain automatically."
     ]
     return settings
+
+
+def resolve_mail_profile(site):
+    white_label = get_white_label_settings(site)
+    reply_to_email = white_label.get('reply_to_email') or ''
+    return {
+        'from_email': white_label.get('active_from_email') or (os.getenv('MAIL_FROM') or os.getenv('SMTP_USERNAME') or 'no-reply@leadresponse.local').strip(),
+        'from_name': white_label.get('active_from_name') or (os.getenv('MAIL_FROM_NAME') or 'LeadResponse').strip(),
+        'reply_to_email': reply_to_email,
+        'delivery_mode': white_label.get('delivery_mode') or 'platform_domain',
+        'branded_sender_email': white_label.get('branded_sender_email') or '',
+        'platform_from_email': white_label.get('platform_from_email') or '',
+    }
 
 
 def fmt_dt(value):
@@ -496,7 +525,7 @@ def update_lead_status(conn, lead_id, status=None, notes=None):
         conn.execute(sql('UPDATE leads SET notes = ? WHERE id = ?'), (notes, lead_id))
 
 
-def send_email_message(to_email, subject, body_text):
+def send_email_message(site, to_email, subject, body_text):
     to_email = (to_email or '').strip()
     if not to_email:
         return {'ok': False, 'mode': 'skipped', 'error': 'Missing recipient email.'}
@@ -505,16 +534,29 @@ def send_email_message(to_email, subject, body_text):
     port = int((os.getenv('SMTP_PORT') or '587').strip())
     username = (os.getenv('SMTP_USERNAME') or '').strip()
     password = os.getenv('SMTP_PASSWORD') or ''
-    from_email = (os.getenv('MAIL_FROM') or username or 'no-reply@leadresponse.local').strip()
-    from_name = (os.getenv('MAIL_FROM_NAME') or 'LeadResponse').strip()
+    profile = resolve_mail_profile(site)
+    from_email = (profile.get('from_email') or os.getenv('MAIL_FROM') or username or 'no-reply@leadresponse.local').strip()
+    from_name = (profile.get('from_name') or os.getenv('MAIL_FROM_NAME') or 'LeadResponse').strip()
+    reply_to_email = (profile.get('reply_to_email') or '').strip()
 
     if not host:
-        return {'ok': True, 'mode': 'simulation', 'to': to_email, 'subject': subject}
+        return {
+            'ok': True,
+            'mode': 'simulation',
+            'delivery_mode': profile.get('delivery_mode') or 'platform_domain',
+            'to': to_email,
+            'subject': subject,
+            'from_email': from_email,
+            'from_name': from_name,
+            'reply_to_email': reply_to_email,
+        }
 
     msg = EmailMessage()
     msg['Subject'] = subject
     msg['From'] = f'{from_name} <{from_email}>' if from_name else from_email
     msg['To'] = to_email
+    if reply_to_email:
+        msg['Reply-To'] = reply_to_email
     msg.set_content(body_text)
 
     use_ssl = env_flag('SMTP_USE_SSL', False)
@@ -531,9 +573,28 @@ def send_email_message(to_email, subject, body_text):
             if username:
                 server.login(username, password)
             server.send_message(msg)
-        return {'ok': True, 'mode': 'smtp', 'to': to_email, 'subject': subject}
+        return {
+            'ok': True,
+            'mode': 'smtp',
+            'delivery_mode': profile.get('delivery_mode') or 'platform_domain',
+            'to': to_email,
+            'subject': subject,
+            'from_email': from_email,
+            'from_name': from_name,
+            'reply_to_email': reply_to_email,
+        }
     except Exception as exc:
-        return {'ok': False, 'mode': 'error', 'to': to_email, 'subject': subject, 'error': str(exc)}
+        return {
+            'ok': False,
+            'mode': 'error',
+            'delivery_mode': profile.get('delivery_mode') or 'platform_domain',
+            'to': to_email,
+            'subject': subject,
+            'from_email': from_email,
+            'from_name': from_name,
+            'reply_to_email': reply_to_email,
+            'error': str(exc),
+        }
 
 
 def build_ack_email(site, lead):
@@ -696,7 +757,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.7.1 test dashboard · Render Postgres ready</div>
+    <div class="footer-note">LeadResponse v0.7.2 test dashboard · Render Postgres ready</div>
   </div>
 </body>
 </html>
@@ -1221,7 +1282,10 @@ def white_label_status():
         'white_label_enabled': settings['white_label_enabled'],
         'portal_domain_status': settings['portal_domain_status'],
         'email_domain_status': settings['email_domain_status'],
-        'dns_last_checked_at': settings.get('dns_last_checked_at') or ''
+        'dns_last_checked_at': settings.get('dns_last_checked_at') or '',
+        'delivery_mode': settings.get('delivery_mode') or 'platform_domain',
+        'active_from_email': settings.get('active_from_email') or '',
+        'branded_sender_email': settings.get('branded_sender_email') or ''
     })
 
 
@@ -1240,14 +1304,16 @@ def update_white_label_settings_api():
     brand_display_name = (payload.get('brand_display_name') or 'LeadResponse').strip() or 'LeadResponse'
     portal_subdomain = (payload.get('portal_subdomain') or 'go').strip().lower() or 'go'
     email_subdomain = (payload.get('email_subdomain') or 'em').strip().lower() or 'em'
+    email_from_localpart = (payload.get('email_from_localpart') or 'hello').strip().lower() or 'hello'
+    reply_to_email = (payload.get('reply_to_email') or '').strip()
     portal_domain_status = normalize_white_label_status(payload.get('portal_domain_status'))
     email_domain_status = normalize_white_label_status(payload.get('email_domain_status'))
     updated_at = now_iso()
 
     conn = db()
     conn.execute(
-        sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, updated_at = ? WHERE id = ?'),
-        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, updated_at, updated_at, site['id'])
+        sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, email_from_localpart = ?, reply_to_email = ?, updated_at = ? WHERE id = ?'),
+        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, updated_at, email_from_localpart, reply_to_email, updated_at, site['id'])
     )
     create_lead_event(conn, site['id'], None, 'white_label_settings_updated', {
         'white_label_enabled': bool(white_label_enabled),
@@ -1256,6 +1322,8 @@ def update_white_label_settings_api():
         'portal_domain_status': portal_domain_status,
         'email_subdomain': email_subdomain,
         'email_domain_status': email_domain_status,
+        'email_from_localpart': email_from_localpart,
+        'reply_to_email': reply_to_email,
     }, updated_at)
     conn.commit()
 
@@ -1317,7 +1385,7 @@ def lead_events():
     if site_int(site, 'auto_ack_enabled', 1) and (lead.get('email') or '').strip():
         site_data = row_to_dict(site)
         subject, body = build_ack_email(site_data, lead)
-        mail_result = send_email_message((lead.get('email') or '').strip(), subject, body)
+        mail_result = send_email_message(site_data, (lead.get('email') or '').strip(), subject, body)
         create_lead_event(conn, site['id'], lead_id, 'auto_ack_sent', mail_result, now_iso())
         if site['booking_url']:
             create_lead_event(conn, site['id'], lead_id, 'booking_link_sent', {'booking_url': site['booking_url'], 'mode': mail_result.get('mode')}, now_iso())
@@ -1451,7 +1519,7 @@ def run_automation_api():
             continue
 
         subject, body = build_follow_up_email(site_data, lead, step_to_send)
-        result = send_email_message((lead.get('email') or '').strip(), subject, body)
+        result = send_email_message(site_data, (lead.get('email') or '').strip(), subject, body)
         create_lead_event(conn, site['id'], lead['id'], f'follow_up_{step_to_send}_sent', result, now_iso())
         follow_ups_sent += 1
 
