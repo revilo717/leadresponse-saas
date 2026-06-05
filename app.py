@@ -5,6 +5,7 @@ import secrets
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 import smtplib
 import ssl
 from email.message import EmailMessage
@@ -76,6 +77,19 @@ WIDGET_SETTINGS_FIELDS = [
     ('widget_success_title', 'Success title', 'single'),
     ('widget_success_message', 'Success copy', 'multi'),
 ]
+
+
+WHITE_LABEL_DEFAULTS = {
+    'white_label_enabled': 0,
+    'brand_display_name': 'LeadResponse',
+    'portal_subdomain': 'go',
+    'portal_domain_status': 'not_started',
+    'email_subdomain': 'em',
+    'email_domain_status': 'not_started',
+    'dns_last_checked_at': '',
+}
+
+WHITE_LABEL_STATUS_VALUES = {'not_started', 'pending', 'verified', 'failed'}
 
 
 class DBConnection:
@@ -290,6 +304,13 @@ def init_db():
         'followup_1_hours': "followup_1_hours INTEGER DEFAULT 2",
         'followup_2_hours': "followup_2_hours INTEGER DEFAULT 24",
         'followup_3_hours': "followup_3_hours INTEGER DEFAULT 72",
+        'white_label_enabled': "white_label_enabled INTEGER DEFAULT 0",
+        'brand_display_name': "brand_display_name TEXT DEFAULT 'LeadResponse'",
+        'portal_subdomain': "portal_subdomain TEXT DEFAULT 'go'",
+        'portal_domain_status': "portal_domain_status TEXT DEFAULT 'not_started'",
+        'email_subdomain': "email_subdomain TEXT DEFAULT 'em'",
+        'email_domain_status': "email_domain_status TEXT DEFAULT 'not_started'",
+        'dns_last_checked_at': "dns_last_checked_at TEXT",
     }
     for column_name, column_sql in site_columns.items():
         ensure_column(conn, 'sites', column_name, column_sql)
@@ -331,6 +352,55 @@ def get_widget_settings(site):
         settings[key] = value if value not in (None, '') else default
     settings['booking_url'] = site_data.get('booking_url') or ''
     settings['widget_enabled'] = bool(site_data.get('widget_enabled', 1))
+    return settings
+
+
+
+def normalize_white_label_status(value, default='not_started'):
+    value = (value or '').strip().lower()
+    return value if value in WHITE_LABEL_STATUS_VALUES else default
+
+
+def parse_site_hostname(value):
+    raw = (value or '').strip()
+    if not raw:
+        return ''
+    candidate = raw if '://' in raw else f'https://{raw}'
+    try:
+        return (urlparse(candidate).hostname or '').lower()
+    except Exception:
+        return ''
+
+
+def get_white_label_settings(site):
+    site_data = row_to_dict(site) or {}
+    settings = {}
+    for key, default in WHITE_LABEL_DEFAULTS.items():
+        value = site_data.get(key)
+        settings[key] = value if value not in (None, '') else default
+
+    settings['white_label_enabled'] = bool(site_int(site_data, 'white_label_enabled', 0))
+    settings['portal_domain_status'] = normalize_white_label_status(settings.get('portal_domain_status'))
+    settings['email_domain_status'] = normalize_white_label_status(settings.get('email_domain_status'))
+    settings['brand_display_name'] = (settings.get('brand_display_name') or site_data.get('name') or 'LeadResponse').strip()
+    settings['site_domain'] = parse_site_hostname(site_data.get('domain') or '')
+    settings['portal_subdomain'] = (settings.get('portal_subdomain') or 'go').strip().lower()
+    settings['email_subdomain'] = (settings.get('email_subdomain') or 'em').strip().lower()
+    settings['portal_domain'] = f"{settings['portal_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
+    settings['email_domain'] = f"{settings['email_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
+    settings['portal_cname_target'] = (os.getenv('WHITE_LABEL_PORTAL_TARGET') or 'leadresponse-saas.onrender.com').strip()
+    settings['mail_from_name'] = settings['brand_display_name']
+    settings['portal_dns_record'] = {
+        'host': settings['portal_subdomain'],
+        'type': 'CNAME',
+        'value': settings['portal_cname_target'],
+        'priority': ''
+    }
+    settings['email_dns_steps'] = [
+        f"Create the sending subdomain {settings['email_domain'] or '[email-subdomain].[client-domain]' } in your email provider.",
+        "Add the SPF, DKIM, tracking CNAME, and MX records issued by the email provider for that sending subdomain.",
+        "Leave live sending on the platform domain until the branded email domain is verified."
+    ]
     return settings
 
 
@@ -626,7 +696,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.7.0 test dashboard · Render Postgres ready</div>
+    <div class="footer-note">LeadResponse v0.7.1 test dashboard · Render Postgres ready</div>
   </div>
 </body>
 </html>
@@ -1128,6 +1198,69 @@ def widget_config():
         'primary_color': '#2575fc',
         **settings
     })
+
+
+
+@app.route('/api/v1/sites/white-label-config', methods=['GET'])
+def white_label_config():
+    site_token = (request.args.get('site_token') or '').strip()
+    site = get_site_by_token(site_token)
+    if not site:
+        return jsonify({'error': 'Site not found.'}), 404
+    return jsonify(get_white_label_settings(site))
+
+
+@app.route('/api/v1/sites/white-label-status', methods=['GET'])
+def white_label_status():
+    site_token = (request.args.get('site_token') or '').strip()
+    site = get_site_by_token(site_token)
+    if not site:
+        return jsonify({'error': 'Site not found.'}), 404
+    settings = get_white_label_settings(site)
+    return jsonify({
+        'white_label_enabled': settings['white_label_enabled'],
+        'portal_domain_status': settings['portal_domain_status'],
+        'email_domain_status': settings['email_domain_status'],
+        'dns_last_checked_at': settings.get('dns_last_checked_at') or ''
+    })
+
+
+@app.route('/api/v1/sites/white-label-settings/update', methods=['POST'])
+def update_white_label_settings_api():
+    payload = request.get_json(silent=True) or {}
+    site_token = (payload.get('site_token') or '').strip()
+    site_secret = (payload.get('site_secret') or '').strip()
+    site = get_site_by_token(site_token)
+    if not site:
+        return jsonify({'error': 'Invalid site token.'}), 404
+    if not site_secret or site_secret != site['site_secret']:
+        return jsonify({'error': 'Invalid site secret.'}), 403
+
+    white_label_enabled = 1 if payload.get('white_label_enabled') else 0
+    brand_display_name = (payload.get('brand_display_name') or 'LeadResponse').strip() or 'LeadResponse'
+    portal_subdomain = (payload.get('portal_subdomain') or 'go').strip().lower() or 'go'
+    email_subdomain = (payload.get('email_subdomain') or 'em').strip().lower() or 'em'
+    portal_domain_status = normalize_white_label_status(payload.get('portal_domain_status'))
+    email_domain_status = normalize_white_label_status(payload.get('email_domain_status'))
+    updated_at = now_iso()
+
+    conn = db()
+    conn.execute(
+        sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, updated_at = ? WHERE id = ?'),
+        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, updated_at, updated_at, site['id'])
+    )
+    create_lead_event(conn, site['id'], None, 'white_label_settings_updated', {
+        'white_label_enabled': bool(white_label_enabled),
+        'brand_display_name': brand_display_name,
+        'portal_subdomain': portal_subdomain,
+        'portal_domain_status': portal_domain_status,
+        'email_subdomain': email_subdomain,
+        'email_domain_status': email_domain_status,
+    }, updated_at)
+    conn.commit()
+
+    refreshed = db().execute(sql('SELECT * FROM sites WHERE id = ?'), (site['id'],)).fetchone()
+    return jsonify({'success': True, 'item': get_white_label_settings(refreshed)})
 
 
 @app.route('/api/v1/lead-events', methods=['POST'])
