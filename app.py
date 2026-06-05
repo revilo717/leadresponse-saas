@@ -5,6 +5,9 @@ import secrets
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+import smtplib
+import ssl
+from email.message import EmailMessage
 
 try:
     import psycopg2
@@ -19,7 +22,7 @@ DEFAULT_SQLITE_PATH = BASE_DIR / 'leadresponse.sqlite'
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
 
-ALLOWED_STATUSES = ['new', 'open', 'won', 'lost']
+ALLOWED_STATUSES = ['new', 'acknowledged', 'qualified', 'booking_sent', 'open', 'booked', 'won', 'lost', 'no_response']
 
 WIDGET_TEXT_DEFAULTS = {
     'widget_title': 'LeadResponse',
@@ -282,6 +285,11 @@ def init_db():
         'widget_success_title': "widget_success_title TEXT DEFAULT 'Thanks — your enquiry has been sent.'",
         'widget_success_message': "widget_success_message TEXT DEFAULT 'We have captured your details and qualification answers.'",
         'widget_cta_label': "widget_cta_label TEXT DEFAULT 'Book a call instead'",
+        'auto_ack_enabled': "auto_ack_enabled INTEGER DEFAULT 1",
+        'follow_up_enabled': "follow_up_enabled INTEGER DEFAULT 1",
+        'followup_1_hours': "followup_1_hours INTEGER DEFAULT 2",
+        'followup_2_hours': "followup_2_hours INTEGER DEFAULT 24",
+        'followup_3_hours': "followup_3_hours INTEGER DEFAULT 72",
     }
     for column_name, column_sql in site_columns.items():
         ensure_column(conn, 'sites', column_name, column_sql)
@@ -359,6 +367,156 @@ def safe_status(value):
     return value if value in ALLOWED_STATUSES else 'new'
 
 
+def env_flag(name, default=False):
+    value = (os.getenv(name) or '').strip().lower()
+    if value == '':
+        return default
+    return value in ('1', 'true', 'yes', 'on')
+
+
+def parse_iso_ts(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
+def hours_since(value):
+    dt = parse_iso_ts(value)
+    if dt is None:
+        return 0
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0)
+
+
+def site_int(site, key, default):
+    try:
+        value = row_to_dict(site).get(key)
+    except Exception:
+        value = None
+    try:
+        return int(value) if value is not None else int(default)
+    except Exception:
+        return int(default)
+
+
+def create_lead_event(conn, site_id, lead_id, event_type, payload, created_at=None):
+    created_at = created_at or now_iso()
+    conn.execute(
+        sql('INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)'),
+        (site_id, lead_id, event_type, json.dumps(payload), created_at)
+    )
+
+
+def latest_event_for_lead(lead_id, event_type):
+    row = db().execute(
+        sql('SELECT * FROM lead_events WHERE lead_id = ? AND event_type = ? ORDER BY id DESC LIMIT 1'),
+        (lead_id, event_type)
+    ).fetchone()
+    return row_to_dict(row)
+
+
+def update_lead_status(conn, lead_id, status=None, notes=None):
+    if status is not None and notes is not None:
+        conn.execute(sql('UPDATE leads SET status = ?, notes = ? WHERE id = ?'), (status, notes, lead_id))
+    elif status is not None:
+        conn.execute(sql('UPDATE leads SET status = ? WHERE id = ?'), (status, lead_id))
+    elif notes is not None:
+        conn.execute(sql('UPDATE leads SET notes = ? WHERE id = ?'), (notes, lead_id))
+
+
+def send_email_message(to_email, subject, body_text):
+    to_email = (to_email or '').strip()
+    if not to_email:
+        return {'ok': False, 'mode': 'skipped', 'error': 'Missing recipient email.'}
+
+    host = (os.getenv('SMTP_HOST') or '').strip()
+    port = int((os.getenv('SMTP_PORT') or '587').strip())
+    username = (os.getenv('SMTP_USERNAME') or '').strip()
+    password = os.getenv('SMTP_PASSWORD') or ''
+    from_email = (os.getenv('MAIL_FROM') or username or 'no-reply@leadresponse.local').strip()
+    from_name = (os.getenv('MAIL_FROM_NAME') or 'LeadResponse').strip()
+
+    if not host:
+        return {'ok': True, 'mode': 'simulation', 'to': to_email, 'subject': subject}
+
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = f'{from_name} <{from_email}>' if from_name else from_email
+    msg['To'] = to_email
+    msg.set_content(body_text)
+
+    use_ssl = env_flag('SMTP_USE_SSL', False)
+    use_tls = env_flag('SMTP_USE_TLS', not use_ssl)
+
+    try:
+        if use_ssl:
+            server = smtplib.SMTP_SSL(host, port, timeout=20, context=ssl.create_default_context())
+        else:
+            server = smtplib.SMTP(host, port, timeout=20)
+        with server:
+            if not use_ssl and use_tls:
+                server.starttls(context=ssl.create_default_context())
+            if username:
+                server.login(username, password)
+            server.send_message(msg)
+        return {'ok': True, 'mode': 'smtp', 'to': to_email, 'subject': subject}
+    except Exception as exc:
+        return {'ok': False, 'mode': 'error', 'to': to_email, 'subject': subject, 'error': str(exc)}
+
+
+def build_ack_email(site, lead):
+    site_name = (site.get('name') or 'LeadResponse') if isinstance(site, dict) else (site['name'] or 'LeadResponse')
+    lead_name = (lead.get('first_name') or 'there').strip() or 'there'
+    booking_url = (site.get('booking_url') or '') if isinstance(site, dict) else (site['booking_url'] or '')
+    subject = f'Thanks {lead_name} — we received your enquiry'
+    body = [
+        f'Hi {lead_name},',
+        '',
+        f'Thanks for contacting {site_name}. We have received your enquiry and the details below have been captured:',
+        '',
+        f"Service: {(lead.get('service_type') or '').strip() or 'Not provided'}",
+        f"Postcode: {(lead.get('postcode') or '').strip() or 'Not provided'}",
+        f"Urgency: {(lead.get('urgency') or '').strip() or 'Not provided'}",
+        '',
+        'We will review this and follow up with the next step shortly.'
+    ]
+    if booking_url:
+        body.extend(['', f'If you would prefer, you can book the next step now: {booking_url}'])
+    body.extend(['', 'Regards,', site_name])
+    return subject, '\n'.join(body)
+
+
+def build_follow_up_email(site, lead, step_number):
+    site_name = (site.get('name') or 'LeadResponse') if isinstance(site, dict) else (site['name'] or 'LeadResponse')
+    lead_name = (lead.get('first_name') or 'there').strip() or 'there'
+    booking_url = (site.get('booking_url') or '') if isinstance(site, dict) else (site['booking_url'] or '')
+    subjects = {
+        1: f'{lead_name}, just checking on your enquiry',
+        2: f'Quick follow-up on your enquiry',
+        3: f'Final follow-up before we close your enquiry',
+    }
+    intros = {
+        1: 'We wanted to follow up to make sure you still need help with this job.',
+        2: 'We are following up again in case you still want to move this forward.',
+        3: 'This is our final automated follow-up before we mark the enquiry as no response.',
+    }
+    body = [
+        f'Hi {lead_name},',
+        '',
+        intros.get(step_number, 'We are following up on your enquiry.'),
+        '',
+        f"Service: {(lead.get('service_type') or '').strip() or 'Not provided'}",
+        f"Postcode: {(lead.get('postcode') or '').strip() or 'Not provided'}",
+        f"Urgency: {(lead.get('urgency') or '').strip() or 'Not provided'}",
+    ]
+    if booking_url:
+        body.extend(['', f'If you are ready, book the next step here: {booking_url}'])
+    body.extend(['', 'Reply to this email if you would like us to help.', '', 'Regards,', site_name])
+    return subjects.get(step_number, 'LeadResponse follow-up'), '\n'.join(body)
+
+
 BASE_HTML = '''
 <!doctype html>
 <html lang="en">
@@ -433,6 +591,11 @@ BASE_HTML = '''
     .badge-open { background:#fff5df; color:#996600; border-color:#f5dfb0; }
     .badge-won { background:#eaf2ff; color:var(--blue-dark); border-color:#d5e3ff; }
     .badge-lost { background:#fff0f0; color:#b33a3a; border-color:#f4d1d1; }
+    .badge-acknowledged { background:#eef6ff; color:#2456c7; border-color:#d6e4ff; }
+    .badge-qualified { background:#f0fdf8; color:#0a8f5b; border-color:#cdeedd; }
+    .badge-booking_sent { background:#f5f0ff; color:#6e45c7; border-color:#e3d8ff; }
+    .badge-booked { background:#e8fff5; color:#0b8b4d; border-color:#c9efd9; }
+    .badge-no_response { background:#f7f7f8; color:#5b6678; border-color:#dde2ea; }
     .action { display:inline-flex; align-items:center; justify-content:center; padding:10px 14px; border-radius:12px; border:1px solid rgba(37,117,252,.18); background:var(--blue-soft); color:var(--blue-dark); font-weight:700; transition:.16s ease; }
     .action:hover { transform:translateY(-1px); background:#dce9ff; }
     .empty { border:2px dashed var(--line); border-radius:18px; padding:28px; background:#fbfdff; text-align:center; }
@@ -463,7 +626,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.6.2 test dashboard · Render Postgres ready</div>
+    <div class="footer-note">LeadResponse v0.7.0 test dashboard · Render Postgres ready</div>
   </div>
 </body>
 </html>
@@ -633,7 +796,7 @@ def dashboard():
                 <div class="muted"><strong>Urgency:</strong> {{ label_urgency(lead['urgency']) }}</div>
               </td>
               <td data-label="Message">{{ (lead['message'] or '—')[:100] }}{% if lead['message'] and lead['message']|length > 100 %}…{% endif %}</td>
-              <td data-label="Status"><span class="badge badge-{{ lead['status'] if lead['status'] in ['new', 'open', 'won', 'lost'] else 'open' }}">{{ lead['status'] }}</span></td>
+              <td data-label="Status"><span class="badge badge-{{ lead['status'] if lead['status'] in ['new', 'acknowledged', 'qualified', 'booking_sent', 'open', 'booked', 'won', 'lost', 'no_response'] else 'open' }}">{{ lead['status'].replace('_', ' ') }}</span></td>
               <td data-label="Notes">{{ (lead['notes'] or '—')[:70] }}{% if lead['notes'] and lead['notes']|length > 70 %}…{% endif %}</td>
               <td data-label="Received">{{ fmt_dt(lead['created_at']) }}</td>
               <td data-label="Open"><a class="action" href="{{ url_for('lead_detail_page', lead_id=lead['id'], site_token=site['site_token']) }}">View</a></td>
@@ -740,7 +903,7 @@ def lead_detail_page(lead_id):
             <label>
               Status
               <select name="status">
-                {% for value in ['new', 'open', 'won', 'lost'] %}
+                {% for value in ['new', 'acknowledged', 'qualified', 'booking_sent', 'open', 'booked', 'won', 'lost', 'no_response'] %}
                   <option value="{{ value }}" {% if lead['status'] == value %}selected{% endif %}>{{ value.title() }}</option>
                 {% endfor %}
               </select>
@@ -1012,20 +1175,33 @@ def lead_events():
             lead_values,
         )
         lead_id = cur.lastrowid
-    conn.execute(
-        sql(sql('INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)')),
-        (site['id'], lead_id, payload.get('event_type') or 'lead_created', json.dumps(payload), created_at)
-    )
+
+    create_lead_event(conn, site['id'], lead_id, payload.get('event_type') or 'lead_created', payload, created_at)
+
+    next_status = 'booking_sent' if site['booking_url'] else 'acknowledged'
+    next_message = 'Thanks — we have received your enquiry. Check your email for the next step.'
+
+    if site_int(site, 'auto_ack_enabled', 1) and (lead.get('email') or '').strip():
+        site_data = row_to_dict(site)
+        subject, body = build_ack_email(site_data, lead)
+        mail_result = send_email_message((lead.get('email') or '').strip(), subject, body)
+        create_lead_event(conn, site['id'], lead_id, 'auto_ack_sent', mail_result, now_iso())
+        if site['booking_url']:
+            create_lead_event(conn, site['id'], lead_id, 'booking_link_sent', {'booking_url': site['booking_url'], 'mode': mail_result.get('mode')}, now_iso())
+    else:
+        next_message = 'Thanks — we have received your enquiry and will follow up shortly.'
+
+    update_lead_status(conn, lead_id, next_status)
     conn.commit()
 
     return jsonify({
         'success': True,
         'lead_id': lead_id,
-        'status': 'new',
+        'status': next_status,
         'next_action': {
             'type': 'booking_prompt' if site['booking_url'] else 'message',
             'booking_url': site['booking_url'] or '',
-            'message': 'Lead captured successfully.'
+            'message': next_message
         }
     })
 
@@ -1084,9 +1260,88 @@ def update_lead_api(lead_id):
     return jsonify({'success': True, 'item': row_to_dict(updated)})
 
 
+@app.route('/api/v1/automation/run', methods=['POST'])
+def run_automation_api():
+    payload = request.get_json(silent=True) or {}
+    site_token = (payload.get('site_token') or '').strip()
+    site_secret = (payload.get('site_secret') or '').strip()
+
+    site = get_site_by_token(site_token)
+    if not site:
+        return jsonify({'error': 'Invalid site token.'}), 404
+
+    if not site_secret or site_secret != site['site_secret']:
+        return jsonify({'error': 'Invalid site secret.'}), 403
+
+    site_data = row_to_dict(site)
+    if not site_int(site, 'follow_up_enabled', 1):
+        return jsonify({'success': True, 'processed': 0, 'follow_ups_sent': 0, 'no_response_marked': 0, 'message': 'Follow-up engine is disabled for this site.'})
+
+    thresholds = {
+        1: site_int(site, 'followup_1_hours', 2),
+        2: site_int(site, 'followup_2_hours', 24),
+        3: site_int(site, 'followup_3_hours', 72),
+    }
+    eligible_statuses = ['new', 'acknowledged', 'qualified', 'booking_sent', 'open']
+    rows = db().execute(
+        sql('SELECT * FROM leads WHERE site_id = ? ORDER BY id DESC LIMIT 200'),
+        (site['id'],)
+    ).fetchall()
+
+    processed = 0
+    follow_ups_sent = 0
+    no_response_marked = 0
+    conn = db()
+
+    for row in rows:
+        lead = row_to_dict(row)
+        if (lead.get('status') or 'new') not in eligible_statuses:
+            continue
+        if not (lead.get('email') or '').strip():
+            continue
+
+        processed += 1
+        elapsed = hours_since(lead.get('created_at'))
+        f1 = latest_event_for_lead(lead['id'], 'follow_up_1_sent')
+        f2 = latest_event_for_lead(lead['id'], 'follow_up_2_sent')
+        f3 = latest_event_for_lead(lead['id'], 'follow_up_3_sent')
+
+        step_to_send = None
+        if not f1 and elapsed >= thresholds[1]:
+            step_to_send = 1
+        elif f1 and not f2 and elapsed >= thresholds[2]:
+            step_to_send = 2
+        elif f2 and not f3 and elapsed >= thresholds[3]:
+            step_to_send = 3
+
+        if step_to_send is None:
+            continue
+
+        subject, body = build_follow_up_email(site_data, lead, step_to_send)
+        result = send_email_message((lead.get('email') or '').strip(), subject, body)
+        create_lead_event(conn, site['id'], lead['id'], f'follow_up_{step_to_send}_sent', result, now_iso())
+        follow_ups_sent += 1
+
+        if step_to_send == 1 and site['booking_url']:
+            update_lead_status(conn, lead['id'], 'booking_sent')
+        if step_to_send == 3:
+            update_lead_status(conn, lead['id'], 'no_response')
+            create_lead_event(conn, site['id'], lead['id'], 'lead_marked_no_response', {'reason': 'final_follow_up_sent'}, now_iso())
+            no_response_marked += 1
+
+    conn.commit()
+    return jsonify({
+        'success': True,
+        'processed': processed,
+        'follow_ups_sent': follow_ups_sent,
+        'no_response_marked': no_response_marked,
+        'message': 'Website follow-up engine run completed.'
+    })
+
+
 @app.route('/health')
 def health():
-    return jsonify({'ok': True, 'time': now_iso(), 'db_backend': get_db_backend()})
+    return jsonify({'ok': True, 'time': now_iso(), 'db_backend': get_db_backend(), 'mail_mode': 'smtp' if (os.getenv('SMTP_HOST') or '').strip() else 'simulation'})
 
 
 init_db()
