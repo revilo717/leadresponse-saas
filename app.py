@@ -21,6 +21,59 @@ app.config['JSON_SORT_KEYS'] = False
 
 ALLOWED_STATUSES = ['new', 'open', 'won', 'lost']
 
+WIDGET_TEXT_DEFAULTS = {
+    'widget_title': 'LeadResponse',
+    'widget_button_text': 'LeadResponse',
+    'welcome_message': 'Hi, tell us a little about your job and we will get back to you quickly.',
+    'widget_label_service': 'What do you need help with',
+    'widget_placeholder_service': 'e.g. Boiler repair',
+    'widget_label_postcode': 'Your postcode',
+    'widget_placeholder_postcode': 'e.g. SW1A 1AA',
+    'widget_label_urgency': 'How urgent is it',
+    'widget_placeholder_urgency': 'Select urgency',
+    'widget_label_first_name': 'First name',
+    'widget_placeholder_first_name': 'Your first name',
+    'widget_label_email': 'Email address',
+    'widget_placeholder_email': 'you@example.com',
+    'widget_label_phone': 'Phone number',
+    'widget_placeholder_phone': 'Phone number',
+    'widget_label_message': 'Job details',
+    'widget_placeholder_message': 'Tell us what you need',
+    'widget_next_text': 'Next',
+    'widget_back_text': 'Back',
+    'widget_submit_text': 'Send',
+    'widget_success_title': 'Thanks — your enquiry has been sent.',
+    'widget_success_message': 'We have captured your details and qualification answers.',
+    'widget_cta_label': 'Book a call instead',
+}
+
+WIDGET_SETTINGS_FIELDS = [
+    ('widget_title', 'Widget title', 'single'),
+    ('widget_button_text', 'Launcher button text', 'single'),
+    ('welcome_message', 'Intro copy', 'multi'),
+    ('booking_url', 'CTA booking URL', 'single'),
+    ('widget_cta_label', 'CTA label', 'single'),
+    ('widget_label_service', 'Service label', 'single'),
+    ('widget_placeholder_service', 'Service placeholder', 'single'),
+    ('widget_label_postcode', 'Postcode label', 'single'),
+    ('widget_placeholder_postcode', 'Postcode placeholder', 'single'),
+    ('widget_label_urgency', 'Urgency label', 'single'),
+    ('widget_placeholder_urgency', 'Urgency placeholder', 'single'),
+    ('widget_label_first_name', 'First name label', 'single'),
+    ('widget_placeholder_first_name', 'First name placeholder', 'single'),
+    ('widget_label_email', 'Email label', 'single'),
+    ('widget_placeholder_email', 'Email placeholder', 'single'),
+    ('widget_label_phone', 'Phone label', 'single'),
+    ('widget_placeholder_phone', 'Phone placeholder', 'single'),
+    ('widget_label_message', 'Message label', 'single'),
+    ('widget_placeholder_message', 'Message placeholder', 'single'),
+    ('widget_next_text', 'Next button text', 'single'),
+    ('widget_back_text', 'Back button text', 'single'),
+    ('widget_submit_text', 'Submit button text', 'single'),
+    ('widget_success_title', 'Success title', 'single'),
+    ('widget_success_message', 'Success copy', 'multi'),
+]
+
 
 class DBConnection:
     def __init__(self, conn, backend):
@@ -206,6 +259,33 @@ def init_db():
     ensure_column(conn, 'leads', 'urgency', 'urgency TEXT')
     ensure_column(conn, 'leads', 'notes', "notes TEXT DEFAULT ''")
 
+    site_columns = {
+        'widget_title': "widget_title TEXT DEFAULT 'LeadResponse'",
+        'widget_button_text': "widget_button_text TEXT DEFAULT 'LeadResponse'",
+        'widget_label_service': "widget_label_service TEXT DEFAULT 'What do you need help with'",
+        'widget_placeholder_service': "widget_placeholder_service TEXT DEFAULT 'e.g. Boiler repair'",
+        'widget_label_postcode': "widget_label_postcode TEXT DEFAULT 'Your postcode'",
+        'widget_placeholder_postcode': "widget_placeholder_postcode TEXT DEFAULT 'e.g. SW1A 1AA'",
+        'widget_label_urgency': "widget_label_urgency TEXT DEFAULT 'How urgent is it'",
+        'widget_placeholder_urgency': "widget_placeholder_urgency TEXT DEFAULT 'Select urgency'",
+        'widget_label_first_name': "widget_label_first_name TEXT DEFAULT 'First name'",
+        'widget_placeholder_first_name': "widget_placeholder_first_name TEXT DEFAULT 'Your first name'",
+        'widget_label_email': "widget_label_email TEXT DEFAULT 'Email address'",
+        'widget_placeholder_email': "widget_placeholder_email TEXT DEFAULT 'you@example.com'",
+        'widget_label_phone': "widget_label_phone TEXT DEFAULT 'Phone number'",
+        'widget_placeholder_phone': "widget_placeholder_phone TEXT DEFAULT 'Phone number'",
+        'widget_label_message': "widget_label_message TEXT DEFAULT 'Job details'",
+        'widget_placeholder_message': "widget_placeholder_message TEXT DEFAULT 'Tell us what you need'",
+        'widget_next_text': "widget_next_text TEXT DEFAULT 'Next'",
+        'widget_back_text': "widget_back_text TEXT DEFAULT 'Back'",
+        'widget_submit_text': "widget_submit_text TEXT DEFAULT 'Send'",
+        'widget_success_title': "widget_success_title TEXT DEFAULT 'Thanks — your enquiry has been sent.'",
+        'widget_success_message': "widget_success_message TEXT DEFAULT 'We have captured your details and qualification answers.'",
+        'widget_cta_label': "widget_cta_label TEXT DEFAULT 'Book a call instead'",
+    }
+    for column_name, column_sql in site_columns.items():
+        ensure_column(conn, 'sites', column_name, column_sql)
+
     conn.commit()
     conn.close()
 
@@ -233,6 +313,17 @@ def get_default_site():
     return db().execute(
         sql("SELECT * FROM sites WHERE status = 'connected' ORDER BY id ASC LIMIT 1")
     ).fetchone() or db().execute(sql('SELECT * FROM sites ORDER BY id ASC LIMIT 1')).fetchone()
+
+
+def get_widget_settings(site):
+    site_data = row_to_dict(site) or {}
+    settings = {}
+    for key, default in WIDGET_TEXT_DEFAULTS.items():
+        value = site_data.get(key)
+        settings[key] = value if value not in (None, '') else default
+    settings['booking_url'] = site_data.get('booking_url') or ''
+    settings['widget_enabled'] = bool(site_data.get('widget_enabled', 1))
+    return settings
 
 
 def fmt_dt(value):
@@ -372,7 +463,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.6 test dashboard · Render Postgres ready</div>
+    <div class="footer-note">LeadResponse v0.6.1 test dashboard · Render Postgres ready</div>
   </div>
 </body>
 </html>
@@ -459,6 +550,8 @@ def dashboard():
     won_leads = db().execute(sql("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'won'"), (site['id'],)).fetchone()['c']
     lost_leads = db().execute(sql("SELECT COUNT(*) AS c FROM leads WHERE site_id = ? AND status = 'lost'"), (site['id'],)).fetchone()['c']
     latest = lead_rows[0] if lead_rows else None
+    widget_settings = get_widget_settings(site)
+    widget_saved = (request.args.get('widget_saved') or '') == '1'
 
     body = render_template_string('''
     <section class="hero">
@@ -472,6 +565,10 @@ def dashboard():
         <div class="stat"><div class="label">Won</div><div class="value">{{ won_leads }}</div></div>
       </div>
     </section>
+
+    {% if widget_saved %}
+      <div class="notice-success">Widget settings updated successfully.</div>
+    {% endif %}
 
     <div class="stack">
       <section class="panel">
@@ -488,6 +585,46 @@ def dashboard():
           <span class="pill neutral">Booking URL: {{ site['booking_url'] or 'Not set' }}</span>
           <span class="pill neutral">Lost: {{ lost_leads }}</span>
         </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>Widget settings</h2>
+            <p>Edit the live widget title, copy, field labels, placeholders and CTA text without changing code.</p>
+          </div>
+        </div>
+        <form method="post" action="{{ url_for('save_widget_settings', site_id=site['id']) }}?site_token={{ site['site_token'] }}" class="admin-form">
+          <div class="detail-grid" style="gap:18px;">
+            <div class="stack" style="gap:14px;">
+              {% for key, label, field_type in widget_fields[:13] %}
+                <label>
+                  {{ label }}
+                  {% if field_type == 'multi' %}
+                    <textarea name="{{ key }}" rows="3">{{ widget_settings[key] }}</textarea>
+                  {% else %}
+                    <input type="text" name="{{ key }}" value="{{ widget_settings[key] }}">
+                  {% endif %}
+                </label>
+              {% endfor %}
+            </div>
+            <div class="stack" style="gap:14px;">
+              {% for key, label, field_type in widget_fields[13:] %}
+                <label>
+                  {{ label }}
+                  {% if field_type == 'multi' %}
+                    <textarea name="{{ key }}" rows="3">{{ widget_settings[key] }}</textarea>
+                  {% else %}
+                    <input type="text" name="{{ key }}" value="{{ widget_settings[key] }}">
+                  {% endif %}
+                </label>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="meta" style="margin-top:16px;">
+            <button type="submit">Save widget settings</button>
+          </div>
+        </form>
       </section>
 
       <section class="panel">
@@ -570,7 +707,7 @@ def dashboard():
         </div>
       </section>
     </div>
-    ''', site=site, lead_rows=lead_rows, total_leads=total_leads, new_leads=new_leads, open_leads=open_leads, won_leads=won_leads, lost_leads=lost_leads, latest=latest, sites=sites, fmt_dt=fmt_dt, label_urgency=label_urgency, status_filter=status_filter)
+    ''', site=site, lead_rows=lead_rows, total_leads=total_leads, new_leads=new_leads, open_leads=open_leads, won_leads=won_leads, lost_leads=lost_leads, latest=latest, sites=sites, fmt_dt=fmt_dt, label_urgency=label_urgency, status_filter=status_filter, widget_settings=widget_settings, widget_fields=WIDGET_SETTINGS_FIELDS, widget_saved=widget_saved)
 
     return render_page(body, title='LeadResponse Lead Inbox', current_site=site)
 
@@ -725,6 +862,42 @@ def lead_update_page(lead_id):
     return redirect(url_for('lead_detail_page', lead_id=lead_id, site_token=site['site_token'], updated='1'))
 
 
+@app.route('/dashboard/sites/<int:site_id>/widget-settings/save', methods=['POST'])
+def save_widget_settings(site_id):
+    site_token = (request.args.get('site_token') or '').strip()
+    site = get_site_by_token(site_token) if site_token else None
+    if not site or site['id'] != site_id:
+        site = db().execute(sql('SELECT * FROM sites WHERE id = ?'), (site_id,)).fetchone()
+    if not site:
+        return redirect(url_for('dashboard'))
+
+    site_data = row_to_dict(site) or {}
+    values = []
+    assignments = []
+    for key in WIDGET_TEXT_DEFAULTS.keys():
+        assignments.append(f"{key} = ?")
+        values.append((request.form.get(key) or '').strip() or WIDGET_TEXT_DEFAULTS[key])
+
+    booking_url = (request.form.get('booking_url') or '').strip()
+    updated_at = now_iso()
+    values.extend([booking_url, updated_at, site_id])
+
+    conn = db()
+    conn.execute(
+        sql(f"UPDATE sites SET {', '.join(assignments)}, booking_url = ?, updated_at = ? WHERE id = ?"),
+        values
+    )
+    conn.execute(
+        sql('INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)'),
+        (site_id, None, 'widget_settings_updated', json.dumps({'updated_fields': list(WIDGET_TEXT_DEFAULTS.keys()) + ['booking_url']}), updated_at)
+    )
+    conn.commit()
+
+    refreshed = db().execute(sql('SELECT * FROM sites WHERE id = ?'), (site_id,)).fetchone()
+    refreshed_token = refreshed['site_token'] if refreshed and refreshed['site_token'] else site_token
+    return redirect(url_for('dashboard', site_token=refreshed_token, widget_saved='1'))
+
+
 @app.route('/seed-demo')
 def seed_demo():
     token = 'connect_demo_12345'
@@ -788,12 +961,11 @@ def widget_config():
     if not site:
         return jsonify({'error': 'Site not found.'}), 404
 
+    settings = get_widget_settings(site)
     return jsonify({
-        'brand_name': 'LeadResponse',
+        'brand_name': settings['widget_title'],
         'primary_color': '#2575fc',
-        'widget_enabled': bool(site['widget_enabled']),
-        'welcome_message': site['welcome_message'],
-        'booking_url': site['booking_url'] or ''
+        **settings
     })
 
 
