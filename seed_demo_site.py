@@ -69,6 +69,13 @@ CREATE TABLE IF NOT EXISTS sites (
     widget_title TEXT DEFAULT 'LeadResponse',
     widget_button_text TEXT DEFAULT 'LeadResponse',
     widget_cta_label TEXT DEFAULT 'Book a call instead',
+    white_label_enabled INTEGER NOT NULL DEFAULT 0,
+    brand_display_name TEXT DEFAULT 'LeadResponse',
+    portal_subdomain TEXT DEFAULT 'go',
+    portal_domain_status TEXT DEFAULT 'not_started',
+    email_subdomain TEXT DEFAULT 'em',
+    email_domain_status TEXT DEFAULT 'not_started',
+    dns_last_checked_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )
