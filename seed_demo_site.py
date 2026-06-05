@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS sites (
     email_subdomain TEXT DEFAULT 'em',
     email_domain_status TEXT DEFAULT 'not_started',
     dns_last_checked_at TEXT,
+    email_from_localpart TEXT DEFAULT 'hello',
+    reply_to_email TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )
