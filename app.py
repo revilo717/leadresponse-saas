@@ -463,7 +463,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.6.1 test dashboard · Render Postgres ready</div>
+    <div class="footer-note">LeadResponse v0.6.2 test dashboard · Render Postgres ready</div>
   </div>
 </body>
 </html>
@@ -585,46 +585,6 @@ def dashboard():
           <span class="pill neutral">Booking URL: {{ site['booking_url'] or 'Not set' }}</span>
           <span class="pill neutral">Lost: {{ lost_leads }}</span>
         </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-header">
-          <div>
-            <h2>Widget settings</h2>
-            <p>Edit the live widget title, copy, field labels, placeholders and CTA text without changing code.</p>
-          </div>
-        </div>
-        <form method="post" action="{{ url_for('save_widget_settings', site_id=site['id']) }}?site_token={{ site['site_token'] }}" class="admin-form">
-          <div class="detail-grid" style="gap:18px;">
-            <div class="stack" style="gap:14px;">
-              {% for key, label, field_type in widget_fields[:13] %}
-                <label>
-                  {{ label }}
-                  {% if field_type == 'multi' %}
-                    <textarea name="{{ key }}" rows="3">{{ widget_settings[key] }}</textarea>
-                  {% else %}
-                    <input type="text" name="{{ key }}" value="{{ widget_settings[key] }}">
-                  {% endif %}
-                </label>
-              {% endfor %}
-            </div>
-            <div class="stack" style="gap:14px;">
-              {% for key, label, field_type in widget_fields[13:] %}
-                <label>
-                  {{ label }}
-                  {% if field_type == 'multi' %}
-                    <textarea name="{{ key }}" rows="3">{{ widget_settings[key] }}</textarea>
-                  {% else %}
-                    <input type="text" name="{{ key }}" value="{{ widget_settings[key] }}">
-                  {% endif %}
-                </label>
-              {% endfor %}
-            </div>
-          </div>
-          <div class="meta" style="margin-top:16px;">
-            <button type="submit">Save widget settings</button>
-          </div>
-        </form>
       </section>
 
       <section class="panel">
@@ -896,6 +856,44 @@ def save_widget_settings(site_id):
     refreshed = db().execute(sql('SELECT * FROM sites WHERE id = ?'), (site_id,)).fetchone()
     refreshed_token = refreshed['site_token'] if refreshed and refreshed['site_token'] else site_token
     return redirect(url_for('dashboard', site_token=refreshed_token, widget_saved='1'))
+
+
+@app.route('/api/v1/sites/widget-settings/update', methods=['POST'])
+def update_widget_settings_api():
+    payload = request.get_json(silent=True) or {}
+    site_token = (payload.get('site_token') or '').strip()
+    site_secret = (payload.get('site_secret') or '').strip()
+
+    site = get_site_by_token(site_token)
+    if not site:
+        return jsonify({'error': 'Invalid site token.'}), 404
+
+    if not site_secret or site_secret != site['site_secret']:
+        return jsonify({'error': 'Invalid site secret.'}), 403
+
+    updated_at = now_iso()
+    update_values = []
+    assignments = []
+    for key, default in WIDGET_TEXT_DEFAULTS.items():
+        assignments.append(f"{key} = ?")
+        update_values.append((payload.get(key) or '').strip() or default)
+
+    booking_url = (payload.get('booking_url') or '').strip()
+    update_values.extend([booking_url, updated_at, site['id']])
+
+    conn = db()
+    conn.execute(
+        sql(f"UPDATE sites SET {', '.join(assignments)}, booking_url = ?, updated_at = ? WHERE id = ?"),
+        update_values
+    )
+    conn.execute(
+        sql('INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)'),
+        (site['id'], None, 'widget_settings_updated', json.dumps({'updated_fields': list(WIDGET_TEXT_DEFAULTS.keys()) + ['booking_url']}), updated_at)
+    )
+    conn.commit()
+
+    updated_site = db().execute(sql('SELECT * FROM sites WHERE id = ?'), (site['id'],)).fetchone()
+    return jsonify({'success': True, 'item': get_widget_settings(updated_site)})
 
 
 @app.route('/seed-demo')
