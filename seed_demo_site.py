@@ -66,6 +66,9 @@ CREATE TABLE IF NOT EXISTS sites (
     booking_url TEXT,
     widget_enabled INTEGER NOT NULL DEFAULT 1,
     welcome_message TEXT DEFAULT 'Hi, tell us a little about your job and we will get back to you quickly.',
+    widget_title TEXT DEFAULT 'LeadResponse',
+    widget_button_text TEXT DEFAULT 'LeadResponse',
+    widget_cta_label TEXT DEFAULT 'Book a call instead',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )
