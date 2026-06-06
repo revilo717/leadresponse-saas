@@ -28,6 +28,7 @@ ALLOWED_STATUSES = ['new', 'acknowledged', 'qualified', 'booking_sent', 'open', 
 WIDGET_TEXT_DEFAULTS = {
     'widget_title': 'LeadResponse',
     'widget_button_text': 'LeadResponse',
+    'widget_button_color': '#2575fc',
     'welcome_message': 'Hi, tell us a little about your job and we will get back to you quickly.',
     'widget_label_service': 'What do you need help with',
     'widget_placeholder_service': 'e.g. Boiler repair',
@@ -54,6 +55,7 @@ WIDGET_TEXT_DEFAULTS = {
 WIDGET_SETTINGS_FIELDS = [
     ('widget_title', 'Widget title', 'single'),
     ('widget_button_text', 'Launcher button text', 'single'),
+    ('widget_button_color', 'Launcher button colour', 'single'),
     ('welcome_message', 'Intro copy', 'multi'),
     ('booking_url', 'CTA booking URL', 'single'),
     ('widget_cta_label', 'CTA label', 'single'),
@@ -282,6 +284,7 @@ def init_db():
     site_columns = {
         'widget_title': "widget_title TEXT DEFAULT 'LeadResponse'",
         'widget_button_text': "widget_button_text TEXT DEFAULT 'LeadResponse'",
+        'widget_button_color': "widget_button_color TEXT DEFAULT '#2575fc'",
         'widget_label_service': "widget_label_service TEXT DEFAULT 'What do you need help with'",
         'widget_placeholder_service': "widget_placeholder_service TEXT DEFAULT 'e.g. Boiler repair'",
         'widget_label_postcode': "widget_label_postcode TEXT DEFAULT 'Your postcode'",
@@ -1546,7 +1549,7 @@ def widget_config():
     settings = get_widget_settings(site)
     return jsonify({
         'brand_name': settings['widget_title'],
-        'primary_color': '#2575fc',
+        'primary_color': settings.get('widget_button_color') or '#2575fc',
         **settings
     })
 
