@@ -365,6 +365,7 @@ def normalize_white_label_status(value, default='not_started'):
     return value if value in WHITE_LABEL_STATUS_VALUES else default
 
 
+
 def parse_site_hostname(value):
     raw = (value or '').strip()
     if not raw:
@@ -376,6 +377,42 @@ def parse_site_hostname(value):
         return ''
 
 
+def coerce_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    value = str(value).strip().lower()
+    if value in ('1', 'true', 'yes', 'on', 'y'):
+        return True
+    if value in ('0', 'false', 'no', 'off', 'n', ''):
+        return False
+    return default
+
+
+def clean_subdomain_label(value, default):
+    raw = (value or '').strip().lower()
+    cleaned = ''.join(ch for ch in raw if ch.isalnum() or ch == '-').strip('-')
+    return cleaned or default
+
+
+def clean_localpart(value, default):
+    raw = (value or '').strip().lower()
+    cleaned = ''.join(ch for ch in raw if ch.isalnum() or ch in ('-', '_', '.')).strip('._-')
+    return cleaned or default
+
+
+def clean_email_value(value):
+    raw = (value or '').strip()
+    if not raw:
+        return ''
+    if ' ' in raw or '@' not in raw:
+        return ''
+    return raw
+
+
 def get_white_label_settings(site):
     site_data = row_to_dict(site) or {}
     settings = {}
@@ -383,15 +420,18 @@ def get_white_label_settings(site):
         value = site_data.get(key)
         settings[key] = value if value not in (None, '') else default
 
-    settings['white_label_enabled'] = bool(site_int(site_data, 'white_label_enabled', 0))
-    settings['portal_domain_status'] = normalize_white_label_status(settings.get('portal_domain_status'))
-    settings['email_domain_status'] = normalize_white_label_status(settings.get('email_domain_status'))
-    settings['brand_display_name'] = (settings.get('brand_display_name') or site_data.get('name') or 'LeadResponse').strip()
+    settings['site_id'] = site_data.get('id')
+    settings['site_name'] = site_data.get('name') or 'LeadResponse'
+    settings['white_label_enabled'] = coerce_bool(site_data.get('white_label_enabled'), False)
+    settings['portal_domain_status'] = normalize_white_label_status(site_data.get('portal_domain_status'))
+    settings['email_domain_status'] = normalize_white_label_status(site_data.get('email_domain_status'))
+    settings['brand_display_name'] = (site_data.get('brand_display_name') or site_data.get('name') or 'LeadResponse').strip() or 'LeadResponse'
     settings['site_domain'] = parse_site_hostname(site_data.get('domain') or '')
-    settings['portal_subdomain'] = (settings.get('portal_subdomain') or 'go').strip().lower()
-    settings['email_subdomain'] = (settings.get('email_subdomain') or 'em').strip().lower()
-    settings['email_from_localpart'] = (settings.get('email_from_localpart') or 'hello').strip().lower()
-    settings['reply_to_email'] = (settings.get('reply_to_email') or '').strip()
+    settings['portal_subdomain'] = clean_subdomain_label(site_data.get('portal_subdomain') or 'go', 'go')
+    settings['email_subdomain'] = clean_subdomain_label(site_data.get('email_subdomain') or 'em', 'em')
+    settings['email_from_localpart'] = clean_localpart(site_data.get('email_from_localpart') or 'hello', 'hello')
+    settings['reply_to_email'] = clean_email_value(site_data.get('reply_to_email') or '')
+    settings['dns_last_checked_at'] = (site_data.get('dns_last_checked_at') or '').strip()
     settings['portal_domain'] = f"{settings['portal_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
     settings['email_domain'] = f"{settings['email_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
     settings['portal_cname_target'] = (os.getenv('WHITE_LABEL_PORTAL_TARGET') or 'leadresponse-saas.onrender.com').strip()
@@ -415,10 +455,9 @@ def get_white_label_settings(site):
         f"Create the branded sending subdomain {settings['email_domain'] or '[email-subdomain].[client-domain]'} in your email provider.",
         f"Expected sender after verification: {settings['branded_sender_email'] or '[localpart]@[email-subdomain].[client-domain]'}.",
         f"Add the tracking CNAME {settings['tracking_cname_host']} -> {settings['tracking_cname_value']} together with the SPF, DKIM, and MX records issued by the email provider.",
-        "Until the email domain is verified, acknowledgements and follow-ups continue to send from the platform domain automatically."
+        'Until the email domain is verified, acknowledgements and follow-ups continue to send from the platform domain automatically.'
     ]
     return settings
-
 
 def resolve_mail_profile(site):
     white_label = get_white_label_settings(site)
@@ -1205,11 +1244,44 @@ def seed_demo():
     return jsonify({'connect_token': token})
 
 
+
+def create_connected_site_from_template(conn, template_site, requested_domain, updated_at):
+    template = row_to_dict(template_site) or {}
+    name = (template.get('name') or 'LeadResponse Site').strip() or 'LeadResponse Site'
+    booking_url = template.get('booking_url') or ''
+    connect_token = f"connect_{secrets.token_hex(8)}"
+    site_token = f"site_{secrets.token_hex(12)}"
+    site_secret = f"secret_{secrets.token_hex(24)}"
+
+    if get_db_backend() == 'postgres':
+        cur = conn.cursor()
+        cur.execute(
+            sql('INSERT INTO sites (name, domain, connect_token, site_token, site_secret, status, booking_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id'),
+            (name, requested_domain, connect_token, site_token, site_secret, 'connected', booking_url, updated_at, updated_at)
+        )
+        inserted = cur.fetchone()
+        new_id = inserted['id'] if isinstance(inserted, dict) else inserted[0]
+    else:
+        cur = conn.cursor()
+        cur.execute(
+            sql('INSERT INTO sites (name, domain, connect_token, site_token, site_secret, status, booking_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+            (name, requested_domain, connect_token, site_token, site_secret, 'connected', booking_url, updated_at, updated_at)
+        )
+        new_id = cur.lastrowid
+
+    create_lead_event(conn, new_id, None, 'site_cloned_from_connect_template', {
+        'template_site_id': template.get('id'),
+        'requested_domain': requested_domain,
+    }, updated_at)
+    return {'id': new_id, 'site_token': site_token, 'site_secret': site_secret, 'status': 'connected'}
+
+
 @app.route('/api/v1/sites/connect', methods=['POST'])
 def connect_site():
     payload = request.get_json(silent=True) or {}
     connect_token = (payload.get('connect_token') or '').strip()
     domain = (payload.get('domain') or '').strip()
+    requested_domain = parse_site_hostname(domain)
 
     if not connect_token:
         return jsonify({'error': 'Missing connect token.'}), 400
@@ -1219,18 +1291,25 @@ def connect_site():
     if not site:
         return jsonify({'error': 'Invalid connect token.'}), 404
 
-    site_token = site['site_token'] or f"site_{secrets.token_hex(12)}"
-    site_secret = site['site_secret'] or f"secret_{secrets.token_hex(24)}"
+    site_data = row_to_dict(site)
+    existing_domain = parse_site_hostname(site_data.get('domain') or '')
     updated_at = now_iso()
+
+    if site_data.get('site_token') and requested_domain and existing_domain and existing_domain != requested_domain:
+        connected_clone = create_connected_site_from_template(conn, site_data, domain, updated_at)
+        conn.commit()
+        return jsonify(connected_clone)
+
+    site_token = site_data.get('site_token') or f"site_{secrets.token_hex(12)}"
+    site_secret = site_data.get('site_secret') or f"secret_{secrets.token_hex(24)}"
 
     conn.execute(
         sql('UPDATE sites SET domain = ?, site_token = ?, site_secret = ?, status = ?, updated_at = ? WHERE id = ?'),
-        (domain, site_token, site_secret, 'connected', updated_at, site['id'])
+        (domain, site_token, site_secret, 'connected', updated_at, site_data['id'])
     )
     conn.commit()
 
-    return jsonify({'site_id': site['id'], 'site_token': site_token, 'site_secret': site_secret, 'status': 'connected'})
-
+    return jsonify({'site_id': site_data['id'], 'site_token': site_token, 'site_secret': site_secret, 'status': 'connected'})
 
 @app.route('/api/v1/sites/verify', methods=['POST'])
 def verify_site():
@@ -1289,6 +1368,7 @@ def white_label_status():
     })
 
 
+
 @app.route('/api/v1/sites/white-label-settings/update', methods=['POST'])
 def update_white_label_settings_api():
     payload = request.get_json(silent=True) or {}
@@ -1300,20 +1380,22 @@ def update_white_label_settings_api():
     if not site_secret or site_secret != site['site_secret']:
         return jsonify({'error': 'Invalid site secret.'}), 403
 
-    white_label_enabled = 1 if payload.get('white_label_enabled') else 0
-    brand_display_name = (payload.get('brand_display_name') or 'LeadResponse').strip() or 'LeadResponse'
-    portal_subdomain = (payload.get('portal_subdomain') or 'go').strip().lower() or 'go'
-    email_subdomain = (payload.get('email_subdomain') or 'em').strip().lower() or 'em'
-    email_from_localpart = (payload.get('email_from_localpart') or 'hello').strip().lower() or 'hello'
-    reply_to_email = (payload.get('reply_to_email') or '').strip()
-    portal_domain_status = normalize_white_label_status(payload.get('portal_domain_status'))
-    email_domain_status = normalize_white_label_status(payload.get('email_domain_status'))
+    existing = get_white_label_settings(site)
+    white_label_enabled = 1 if coerce_bool(payload.get('white_label_enabled'), existing.get('white_label_enabled', False)) else 0
+    brand_display_name = (payload.get('brand_display_name') or existing.get('brand_display_name') or 'LeadResponse').strip() or 'LeadResponse'
+    portal_subdomain = clean_subdomain_label(payload.get('portal_subdomain') or existing.get('portal_subdomain') or 'go', 'go')
+    email_subdomain = clean_subdomain_label(payload.get('email_subdomain') or existing.get('email_subdomain') or 'em', 'em')
+    email_from_localpart = clean_localpart(payload.get('email_from_localpart') or existing.get('email_from_localpart') or 'hello', 'hello')
+    reply_to_email = clean_email_value(payload.get('reply_to_email') or '')
+    portal_domain_status = normalize_white_label_status(payload.get('portal_domain_status'), existing.get('portal_domain_status') or 'not_started')
+    email_domain_status = normalize_white_label_status(payload.get('email_domain_status'), existing.get('email_domain_status') or 'not_started')
+    dns_last_checked_at = (payload.get('dns_last_checked_at') or existing.get('dns_last_checked_at') or '').strip()
     updated_at = now_iso()
 
     conn = db()
     conn.execute(
         sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, email_from_localpart = ?, reply_to_email = ?, updated_at = ? WHERE id = ?'),
-        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, updated_at, email_from_localpart, reply_to_email, updated_at, site['id'])
+        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, dns_last_checked_at, email_from_localpart, reply_to_email, updated_at, site['id'])
     )
     create_lead_event(conn, site['id'], None, 'white_label_settings_updated', {
         'white_label_enabled': bool(white_label_enabled),
@@ -1324,12 +1406,12 @@ def update_white_label_settings_api():
         'email_domain_status': email_domain_status,
         'email_from_localpart': email_from_localpart,
         'reply_to_email': reply_to_email,
+        'dns_last_checked_at': dns_last_checked_at,
     }, updated_at)
     conn.commit()
 
     refreshed = db().execute(sql('SELECT * FROM sites WHERE id = ?'), (site['id'],)).fetchone()
     return jsonify({'success': True, 'item': get_white_label_settings(refreshed)})
-
 
 @app.route('/api/v1/lead-events', methods=['POST'])
 def lead_events():
