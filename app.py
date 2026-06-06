@@ -87,6 +87,7 @@ WHITE_LABEL_DEFAULTS = {
     'email_subdomain': 'em',
     'email_domain_status': 'not_started',
     'dns_last_checked_at': '',
+    'email_provider': 'mailgun',
     'email_from_localpart': 'hello',
     'reply_to_email': '',
 }
@@ -313,6 +314,7 @@ def init_db():
         'email_subdomain': "email_subdomain TEXT DEFAULT 'em'",
         'email_domain_status': "email_domain_status TEXT DEFAULT 'not_started'",
         'dns_last_checked_at': "dns_last_checked_at TEXT",
+        'email_provider': "email_provider TEXT DEFAULT 'mailgun'",
         'email_from_localpart': "email_from_localpart TEXT DEFAULT 'hello'",
         'reply_to_email': "reply_to_email TEXT",
     }
@@ -413,6 +415,213 @@ def clean_email_value(value):
     return raw
 
 
+def clean_email_provider(value, default='mailgun'):
+    allowed = {'mailgun', 'sendgrid', 'postmark', 'custom'}
+    raw = (value or '').strip().lower()
+    return raw if raw in allowed else default
+
+
+def email_provider_options():
+    return {
+        'mailgun': 'Mailgun-style DNS pack',
+        'sendgrid': 'SendGrid (use provider-issued values)',
+        'postmark': 'Postmark (use provider-issued values)',
+        'custom': 'Custom provider / my own provider',
+    }
+
+
+def build_email_dns_records(settings):
+    provider = settings.get('email_provider') or 'mailgun'
+    subdomain = settings.get('email_subdomain') or 'em'
+    branded_sender = settings.get('branded_sender_email') or '[localpart]@[email-subdomain].[client-domain]'
+    tracking_host = f"email.{subdomain}"
+
+    if provider == 'mailgun':
+        return [
+            {
+                'host': subdomain,
+                'type': 'TXT',
+                'value': 'v=spf1 include:mailgun.org ~all',
+                'priority': '',
+                'required': True,
+                'notes': 'SPF for the branded email subdomain.',
+            },
+            {
+                'host': f'smtp._domainkey.{subdomain}',
+                'type': 'TXT',
+                'value': 'provider-issued-dkim-public-key',
+                'priority': '',
+                'required': True,
+                'notes': 'Replace with the DKIM key issued for this domain in your Mailgun account.',
+            },
+            {
+                'host': tracking_host,
+                'type': 'CNAME',
+                'value': 'mailgun.org',
+                'priority': '',
+                'required': True,
+                'notes': 'Tracking domain for branded click/open tracking.',
+            },
+            {
+                'host': subdomain,
+                'type': 'MX',
+                'value': 'mxa.mailgun.org',
+                'priority': '10',
+                'required': True,
+                'notes': 'Inbound routing / verification support.',
+            },
+            {
+                'host': subdomain,
+                'type': 'MX',
+                'value': 'mxb.mailgun.org',
+                'priority': '10',
+                'required': True,
+                'notes': 'Inbound routing / verification support.',
+            },
+            {
+                'host': f'_dmarc.{subdomain}',
+                'type': 'TXT',
+                'value': 'v=DMARC1; p=none;',
+                'priority': '',
+                'required': False,
+                'notes': 'Recommended starting DMARC policy while you test branded sending.',
+            },
+        ]
+
+    if provider == 'sendgrid':
+        return [
+            {
+                'host': subdomain,
+                'type': 'CNAME',
+                'value': 'provider-issued-return-path.sendgrid.net',
+                'priority': '',
+                'required': True,
+                'notes': 'Use the exact return-path host provided by SendGrid domain authentication.',
+            },
+            {
+                'host': f's1._domainkey.{subdomain}',
+                'type': 'CNAME',
+                'value': 'provider-issued-dkim-1.sendgrid.net',
+                'priority': '',
+                'required': True,
+                'notes': 'Use the first DKIM CNAME exactly as issued by SendGrid.',
+            },
+            {
+                'host': f's2._domainkey.{subdomain}',
+                'type': 'CNAME',
+                'value': 'provider-issued-dkim-2.sendgrid.net',
+                'priority': '',
+                'required': True,
+                'notes': 'Use the second DKIM CNAME exactly as issued by SendGrid.',
+            },
+            {
+                'host': f'_dmarc.{subdomain}',
+                'type': 'TXT',
+                'value': 'v=DMARC1; p=none;',
+                'priority': '',
+                'required': False,
+                'notes': 'Recommended starting DMARC policy while you test branded sending.',
+            },
+        ]
+
+    if provider == 'postmark':
+        return [
+            {
+                'host': subdomain,
+                'type': 'TXT',
+                'value': 'provider-issued-spf-or-domain-verification-value',
+                'priority': '',
+                'required': True,
+                'notes': 'Use the domain verification TXT/SPF value issued by Postmark for this sending domain.',
+            },
+            {
+                'host': f'pm-bounces.{subdomain}',
+                'type': 'CNAME',
+                'value': 'pm.mtasv.net',
+                'priority': '',
+                'required': True,
+                'notes': 'Return-path / bounce domain commonly used with Postmark branded sending.',
+            },
+            {
+                'host': f'{subdomain}._domainkey',
+                'type': 'TXT',
+                'value': 'provider-issued-dkim-public-key',
+                'priority': '',
+                'required': True,
+                'notes': 'Replace with the DKIM value issued by Postmark for this sending domain.',
+            },
+            {
+                'host': f'_dmarc.{subdomain}',
+                'type': 'TXT',
+                'value': 'v=DMARC1; p=none;',
+                'priority': '',
+                'required': False,
+                'notes': 'Recommended starting DMARC policy while you test branded sending.',
+            },
+        ]
+
+    return [
+        {
+            'host': subdomain,
+            'type': 'TXT',
+            'value': 'provider-issued-spf-or-domain-verification-value',
+            'priority': '',
+            'required': True,
+            'notes': 'Add the exact SPF or verification TXT record issued by your provider.',
+        },
+        {
+            'host': f'{subdomain}._domainkey',
+            'type': 'TXT or CNAME',
+            'value': 'provider-issued-dkim-value',
+            'priority': '',
+            'required': True,
+            'notes': 'Add the DKIM value issued by your provider.',
+        },
+        {
+            'host': f'track.{subdomain}',
+            'type': 'CNAME',
+            'value': 'provider-issued-tracking-domain',
+            'priority': '',
+            'required': False,
+            'notes': 'Optional branded tracking / click domain if your provider supports it.',
+        },
+        {
+            'host': f'_dmarc.{subdomain}',
+            'type': 'TXT',
+            'value': 'v=DMARC1; p=none;',
+            'priority': '',
+            'required': False,
+            'notes': 'Recommended starting DMARC policy while you test branded sending.',
+        },
+    ]
+
+
+def build_email_dns_steps(settings):
+    provider = settings.get('email_provider') or 'mailgun'
+    branded_sender = settings.get('branded_sender_email') or '[localpart]@[email-subdomain].[client-domain]'
+    email_domain = settings.get('email_domain') or '[email-subdomain].[client-domain]'
+    if provider == 'mailgun':
+        return [
+            f'Create the branded sending subdomain {email_domain} inside Mailgun or your equivalent sending provider account.',
+            'Add the DNS pack below at your DNS host. Replace the DKIM placeholder with the live key issued for this domain.',
+            f'Once the provider marks the domain as verified, LeadResponse can switch branded sending to {branded_sender}.',
+            'Until verification is complete, LeadResponse stays in platform fallback mode automatically.',
+        ]
+    if provider in ('sendgrid', 'postmark'):
+        return [
+            f'Select {settings.get("email_provider_label") or provider.title()} in your provider account and start branded domain authentication for {email_domain}.',
+            'Use the record structure below as your checklist and replace every placeholder value with the exact values issued by the provider.',
+            f'Once the provider marks the domain as verified, LeadResponse can switch branded sending to {branded_sender}.',
+            'Until verification is complete, LeadResponse stays in platform fallback mode automatically.',
+        ]
+    return [
+        f'Use your own provider to authenticate the sending subdomain {email_domain}.',
+        'Add the provider-issued SPF / verification, DKIM, and optional tracking records shown in the table below.',
+        f'Once verified, LeadResponse can switch branded sending to {branded_sender}.',
+        'Until verification is complete, LeadResponse stays in platform fallback mode automatically.',
+    ]
+
+
 def get_white_label_settings(site):
     site_data = row_to_dict(site) or {}
     settings = {}
@@ -429,6 +638,7 @@ def get_white_label_settings(site):
     settings['site_domain'] = parse_site_hostname(site_data.get('domain') or '')
     settings['portal_subdomain'] = clean_subdomain_label(site_data.get('portal_subdomain') or 'go', 'go')
     settings['email_subdomain'] = clean_subdomain_label(site_data.get('email_subdomain') or 'em', 'em')
+    settings['email_provider'] = clean_email_provider(site_data.get('email_provider') or settings.get('email_provider') or 'mailgun', 'mailgun')
     settings['email_from_localpart'] = clean_localpart(site_data.get('email_from_localpart') or 'hello', 'hello')
     settings['reply_to_email'] = clean_email_value(site_data.get('reply_to_email') or '')
     settings['dns_last_checked_at'] = (site_data.get('dns_last_checked_at') or '').strip()
@@ -443,20 +653,21 @@ def get_white_label_settings(site):
     settings['active_from_email'] = settings['branded_sender_email'] if branded_ready else settings['platform_from_email']
     settings['active_from_name'] = settings['brand_display_name'] if branded_ready else settings['platform_from_name']
     settings['mail_from_name'] = settings['active_from_name']
-    settings['tracking_cname_host'] = f"email.{settings['email_subdomain']}" if settings['email_subdomain'] else 'email.em'
-    settings['tracking_cname_value'] = 'mailgun.org'
     settings['portal_dns_record'] = {
         'host': settings['portal_subdomain'],
         'type': 'CNAME',
         'value': settings['portal_cname_target'],
-        'priority': ''
+        'priority': '',
+        'required': True,
+        'notes': 'Portal / branded access record for the client-facing subdomain.',
     }
-    settings['email_dns_steps'] = [
-        f"Create the branded sending subdomain {settings['email_domain'] or '[email-subdomain].[client-domain]'} in your email provider.",
-        f"Expected sender after verification: {settings['branded_sender_email'] or '[localpart]@[email-subdomain].[client-domain]'}.",
-        f"Add the tracking CNAME {settings['tracking_cname_host']} -> {settings['tracking_cname_value']} together with the SPF, DKIM, and MX records issued by the email provider.",
-        'Until the email domain is verified, acknowledgements and follow-ups continue to send from the platform domain automatically.'
-    ]
+    provider_options = email_provider_options()
+    settings['provider_options'] = provider_options
+    settings['email_provider_label'] = provider_options.get(settings['email_provider'], 'Custom provider / my own provider')
+    settings['email_dns_records'] = build_email_dns_records(settings)
+    settings['email_dns_steps'] = build_email_dns_steps(settings)
+    settings['dns_pack_summary'] = 'Email branding normally needs a DNS pack (TXT / CNAME / MX / DMARC), not just one CNAME.'
+    settings['activation_summary'] = 'LeadResponse stays in platform fallback mode until the branded email domain is verified.'
     return settings
 
 def resolve_mail_profile(site):
@@ -796,7 +1007,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.7.2 test dashboard · Render Postgres ready</div>
+    <div class="footer-note">LeadResponse v0.7.5 test dashboard · Render Postgres ready</div>
   </div>
 </body>
 </html>
@@ -1385,6 +1596,7 @@ def update_white_label_settings_api():
     brand_display_name = (payload.get('brand_display_name') or existing.get('brand_display_name') or 'LeadResponse').strip() or 'LeadResponse'
     portal_subdomain = clean_subdomain_label(payload.get('portal_subdomain') or existing.get('portal_subdomain') or 'go', 'go')
     email_subdomain = clean_subdomain_label(payload.get('email_subdomain') or existing.get('email_subdomain') or 'em', 'em')
+    email_provider = clean_email_provider(payload.get('email_provider') or existing.get('email_provider') or 'mailgun', 'mailgun')
     email_from_localpart = clean_localpart(payload.get('email_from_localpart') or existing.get('email_from_localpart') or 'hello', 'hello')
     reply_to_email = clean_email_value(payload.get('reply_to_email') or '')
     portal_domain_status = normalize_white_label_status(payload.get('portal_domain_status'), existing.get('portal_domain_status') or 'not_started')
@@ -1394,8 +1606,8 @@ def update_white_label_settings_api():
 
     conn = db()
     conn.execute(
-        sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, email_from_localpart = ?, reply_to_email = ?, updated_at = ? WHERE id = ?'),
-        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, dns_last_checked_at, email_from_localpart, reply_to_email, updated_at, site['id'])
+        sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, email_provider = ?, email_from_localpart = ?, reply_to_email = ?, updated_at = ? WHERE id = ?'),
+        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, dns_last_checked_at, email_provider, email_from_localpart, reply_to_email, updated_at, site['id'])
     )
     create_lead_event(conn, site['id'], None, 'white_label_settings_updated', {
         'white_label_enabled': bool(white_label_enabled),
@@ -1404,6 +1616,7 @@ def update_white_label_settings_api():
         'portal_domain_status': portal_domain_status,
         'email_subdomain': email_subdomain,
         'email_domain_status': email_domain_status,
+        'email_provider': email_provider,
         'email_from_localpart': email_from_localpart,
         'reply_to_email': reply_to_email,
         'dns_last_checked_at': dns_last_checked_at,
