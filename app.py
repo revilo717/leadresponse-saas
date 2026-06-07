@@ -344,6 +344,13 @@ def row_to_dict(row):
         return dict(row)
 
 
+def log_mail_event(event_name, payload):
+    try:
+        print(f"[{now_iso()}] {event_name} {json.dumps(payload, sort_keys=True)}", flush=True)
+    except Exception:
+        print(f"[{now_iso()}] {event_name} {payload}", flush=True)
+
+
 def get_site_by_token(site_token):
     return db().execute(sql('SELECT * FROM sites WHERE site_token = ?'), (site_token,)).fetchone()
 
@@ -794,7 +801,7 @@ def send_email_message(site, to_email, subject, body_text):
     reply_to_email = (profile.get('reply_to_email') or '').strip()
 
     if not host:
-        return {
+        result = {
             'ok': True,
             'mode': 'simulation',
             'delivery_mode': profile.get('delivery_mode') or 'platform_domain',
@@ -804,6 +811,8 @@ def send_email_message(site, to_email, subject, body_text):
             'from_name': from_name,
             'reply_to_email': reply_to_email,
         }
+        log_mail_event('SMTP_SIMULATION', result)
+        return result
 
     msg = EmailMessage()
     msg['Subject'] = subject
@@ -818,6 +827,20 @@ def send_email_message(site, to_email, subject, body_text):
 
     smtp_timeout = int((os.getenv('SMTP_TIMEOUT_SECONDS') or '10').strip())
 
+    log_mail_event('SMTP_SEND_START', {
+        'host': host,
+        'port': port,
+        'use_ssl': use_ssl,
+        'use_tls': use_tls,
+        'timeout_seconds': smtp_timeout,
+        'to': to_email,
+        'from_email': from_email,
+        'from_name': from_name,
+        'reply_to_email': reply_to_email,
+        'delivery_mode': profile.get('delivery_mode') or 'platform_domain',
+        'subject': subject,
+    })
+
     try:
         if use_ssl:
             server = smtplib.SMTP_SSL(host, port, timeout=smtp_timeout, context=ssl.create_default_context())
@@ -829,7 +852,7 @@ def send_email_message(site, to_email, subject, body_text):
             if username:
                 server.login(username, password)
             server.send_message(msg)
-        return {
+        result = {
             'ok': True,
             'mode': 'smtp',
             'delivery_mode': profile.get('delivery_mode') or 'platform_domain',
@@ -839,8 +862,10 @@ def send_email_message(site, to_email, subject, body_text):
             'from_name': from_name,
             'reply_to_email': reply_to_email,
         }
+        log_mail_event('SMTP_SEND_SUCCESS', result)
+        return result
     except Exception as exc:
-        return {
+        result = {
             'ok': False,
             'mode': 'error',
             'delivery_mode': profile.get('delivery_mode') or 'platform_domain',
@@ -851,6 +876,8 @@ def send_email_message(site, to_email, subject, body_text):
             'reply_to_email': reply_to_email,
             'error': str(exc),
         }
+        log_mail_event('SMTP_SEND_ERROR', result)
+        return result
 
 
 def persist_mail_event_async(site_id, lead_id, event_type, payload):
@@ -866,12 +893,16 @@ def send_ack_email_async(site_data, lead, site_id, lead_id):
     try:
         recipient = (lead.get('email') or '').strip()
         if not recipient:
-            persist_mail_event_async(site_id, lead_id, 'auto_ack_failed', {'ok': False, 'mode': 'skipped', 'error': 'Missing recipient email.'})
+            payload = {'ok': False, 'mode': 'skipped', 'error': 'Missing recipient email.'}
+            log_mail_event('AUTO_ACK_FAILED', {'site_id': site_id, 'lead_id': lead_id, **payload})
+            persist_mail_event_async(site_id, lead_id, 'auto_ack_failed', payload)
             return
 
+        log_mail_event('AUTO_ACK_START', {'site_id': site_id, 'lead_id': lead_id, 'to': recipient})
         subject, body = build_ack_email(site_data, lead)
         mail_result = send_email_message(site_data, recipient, subject, body)
         event_type = 'auto_ack_sent' if mail_result.get('ok') else 'auto_ack_failed'
+        log_mail_event('AUTO_ACK_RESULT', {'site_id': site_id, 'lead_id': lead_id, 'event_type': event_type, **mail_result})
         persist_mail_event_async(site_id, lead_id, event_type, mail_result)
 
         if site_data.get('booking_url') and mail_result.get('ok'):
@@ -881,7 +912,9 @@ def send_ack_email_async(site_data, lead, site_id, lead_id):
                 'delivery_mode': mail_result.get('delivery_mode') or 'platform_domain',
             })
     except Exception as exc:
-        persist_mail_event_async(site_id, lead_id, 'auto_ack_failed', {'ok': False, 'mode': 'error', 'error': str(exc)})
+        payload = {'ok': False, 'mode': 'error', 'error': str(exc)}
+        log_mail_event('AUTO_ACK_FAILED', {'site_id': site_id, 'lead_id': lead_id, **payload})
+        persist_mail_event_async(site_id, lead_id, 'auto_ack_failed', payload)
 
 
 def build_ack_email(site, lead):
@@ -1044,7 +1077,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.8.1 test dashboard · Render Postgres ready</div>
+    <div class="footer-note">LeadResponse v0.8.2 test dashboard · Render Postgres ready</div>
   </div>
 </body>
 </html>
@@ -1716,10 +1749,12 @@ def lead_events():
 
     if site_int(site, 'auto_ack_enabled', 1) and (lead.get('email') or '').strip():
         site_data = row_to_dict(site)
-        create_lead_event(conn, site['id'], lead_id, 'auto_ack_queued', {
+        queued_payload = {
             'to': (lead.get('email') or '').strip(),
             'delivery_mode': resolve_mail_profile(site_data).get('delivery_mode') or 'platform_domain',
-        }, now_iso())
+        }
+        log_mail_event('AUTO_ACK_QUEUED', {'site_id': site['id'], 'lead_id': lead_id, **queued_payload})
+        create_lead_event(conn, site['id'], lead_id, 'auto_ack_queued', queued_payload, now_iso())
         threading.Thread(
             target=send_ack_email_async,
             args=(site_data, dict(lead), site['id'], lead_id),
