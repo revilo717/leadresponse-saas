@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 import smtplib
 import ssl
+import threading
 from email.message import EmailMessage
 
 try:
@@ -815,11 +816,13 @@ def send_email_message(site, to_email, subject, body_text):
     use_ssl = env_flag('SMTP_USE_SSL', False)
     use_tls = env_flag('SMTP_USE_TLS', not use_ssl)
 
+    smtp_timeout = int((os.getenv('SMTP_TIMEOUT_SECONDS') or '10').strip())
+
     try:
         if use_ssl:
-            server = smtplib.SMTP_SSL(host, port, timeout=20, context=ssl.create_default_context())
+            server = smtplib.SMTP_SSL(host, port, timeout=smtp_timeout, context=ssl.create_default_context())
         else:
-            server = smtplib.SMTP(host, port, timeout=20)
+            server = smtplib.SMTP(host, port, timeout=smtp_timeout)
         with server:
             if not use_ssl and use_tls:
                 server.starttls(context=ssl.create_default_context())
@@ -848,6 +851,37 @@ def send_email_message(site, to_email, subject, body_text):
             'reply_to_email': reply_to_email,
             'error': str(exc),
         }
+
+
+def persist_mail_event_async(site_id, lead_id, event_type, payload):
+    conn = connect_db()
+    try:
+        create_lead_event(conn, site_id, lead_id, event_type, payload, now_iso())
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def send_ack_email_async(site_data, lead, site_id, lead_id):
+    try:
+        recipient = (lead.get('email') or '').strip()
+        if not recipient:
+            persist_mail_event_async(site_id, lead_id, 'auto_ack_failed', {'ok': False, 'mode': 'skipped', 'error': 'Missing recipient email.'})
+            return
+
+        subject, body = build_ack_email(site_data, lead)
+        mail_result = send_email_message(site_data, recipient, subject, body)
+        event_type = 'auto_ack_sent' if mail_result.get('ok') else 'auto_ack_failed'
+        persist_mail_event_async(site_id, lead_id, event_type, mail_result)
+
+        if site_data.get('booking_url') and mail_result.get('ok'):
+            persist_mail_event_async(site_id, lead_id, 'booking_link_sent', {
+                'booking_url': site_data.get('booking_url') or '',
+                'mode': mail_result.get('mode'),
+                'delivery_mode': mail_result.get('delivery_mode') or 'platform_domain',
+            })
+    except Exception as exc:
+        persist_mail_event_async(site_id, lead_id, 'auto_ack_failed', {'ok': False, 'mode': 'error', 'error': str(exc)})
 
 
 def build_ack_email(site, lead):
@@ -1010,7 +1044,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.7.5 test dashboard · Render Postgres ready</div>
+    <div class="footer-note">LeadResponse v0.8.1 test dashboard · Render Postgres ready</div>
   </div>
 </body>
 </html>
@@ -1682,11 +1716,15 @@ def lead_events():
 
     if site_int(site, 'auto_ack_enabled', 1) and (lead.get('email') or '').strip():
         site_data = row_to_dict(site)
-        subject, body = build_ack_email(site_data, lead)
-        mail_result = send_email_message(site_data, (lead.get('email') or '').strip(), subject, body)
-        create_lead_event(conn, site['id'], lead_id, 'auto_ack_sent', mail_result, now_iso())
-        if site['booking_url']:
-            create_lead_event(conn, site['id'], lead_id, 'booking_link_sent', {'booking_url': site['booking_url'], 'mode': mail_result.get('mode')}, now_iso())
+        create_lead_event(conn, site['id'], lead_id, 'auto_ack_queued', {
+            'to': (lead.get('email') or '').strip(),
+            'delivery_mode': resolve_mail_profile(site_data).get('delivery_mode') or 'platform_domain',
+        }, now_iso())
+        threading.Thread(
+            target=send_ack_email_async,
+            args=(site_data, dict(lead), site['id'], lead_id),
+            daemon=True,
+        ).start()
     else:
         next_message = 'Thanks — we have received your enquiry and will follow up shortly.'
 
