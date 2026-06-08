@@ -3,6 +3,9 @@ import os
 import sqlite3
 import secrets
 import json
+import imaplib
+import email
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -10,6 +13,8 @@ import smtplib
 import ssl
 import threading
 from email.message import EmailMessage
+from email.utils import parseaddr
+from email.header import decode_header, make_header
 
 try:
     import psycopg2
@@ -25,6 +30,7 @@ app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
 
 ALLOWED_STATUSES = ['new', 'acknowledged', 'qualified', 'booking_sent', 'open', 'booked', 'won', 'lost', 'no_response']
+REPLY_HANDLING_VALUES = {'lead_inbox', 'client_email'}
 
 WIDGET_TEXT_DEFAULTS = {
     'widget_title': 'LeadResponse',
@@ -93,6 +99,7 @@ WHITE_LABEL_DEFAULTS = {
     'email_provider': 'mailgun',
     'email_from_localpart': 'hello',
     'reply_to_email': '',
+    'reply_handling_mode': 'lead_inbox',
 }
 
 WHITE_LABEL_STATUS_VALUES = {'not_started', 'pending', 'verified', 'failed'}
@@ -321,6 +328,7 @@ def init_db():
         'email_provider': "email_provider TEXT DEFAULT 'mailgun'",
         'email_from_localpart': "email_from_localpart TEXT DEFAULT 'hello'",
         'reply_to_email': "reply_to_email TEXT",
+        'reply_handling_mode': "reply_handling_mode TEXT DEFAULT 'lead_inbox'",
     }
     for column_name, column_sql in site_columns.items():
         ensure_column(conn, 'sites', column_name, column_sql)
@@ -424,6 +432,11 @@ def clean_email_value(value):
     if ' ' in raw or '@' not in raw:
         return ''
     return raw
+
+
+def clean_reply_handling_mode(value, default='lead_inbox'):
+    raw = (value or '').strip().lower()
+    return raw if raw in REPLY_HANDLING_VALUES else default
 
 
 def clean_email_provider(value, default='mailgun'):
@@ -652,6 +665,7 @@ def get_white_label_settings(site):
     settings['email_provider'] = clean_email_provider(site_data.get('email_provider') or settings.get('email_provider') or 'mailgun', 'mailgun')
     settings['email_from_localpart'] = clean_localpart(site_data.get('email_from_localpart') or 'hello', 'hello')
     settings['reply_to_email'] = clean_email_value(site_data.get('reply_to_email') or '')
+    settings['reply_handling_mode'] = clean_reply_handling_mode(site_data.get('reply_handling_mode') or 'lead_inbox', 'lead_inbox')
     settings['dns_last_checked_at'] = (site_data.get('dns_last_checked_at') or '').strip()
     settings['portal_domain'] = f"{settings['portal_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
     settings['email_domain'] = f"{settings['email_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
@@ -683,11 +697,15 @@ def get_white_label_settings(site):
 
 def resolve_mail_profile(site):
     white_label = get_white_label_settings(site)
+    reply_mode = clean_reply_handling_mode(white_label.get('reply_handling_mode') or 'lead_inbox', 'lead_inbox')
     reply_to_email = white_label.get('reply_to_email') or ''
+    if reply_mode != 'client_email':
+        reply_to_email = ''
     return {
         'from_email': white_label.get('active_from_email') or (os.getenv('MAIL_FROM') or os.getenv('SMTP_USERNAME') or 'no-reply@leadresponse.local').strip(),
         'from_name': white_label.get('active_from_name') or (os.getenv('MAIL_FROM_NAME') or 'LeadResponse').strip(),
         'reply_to_email': reply_to_email,
+        'reply_handling_mode': reply_mode,
         'delivery_mode': white_label.get('delivery_mode') or 'platform_domain',
         'branded_sender_email': white_label.get('branded_sender_email') or '',
         'platform_from_email': white_label.get('platform_from_email') or '',
@@ -732,6 +750,209 @@ def env_flag(name, default=False):
     if value == '':
         return default
     return value in ('1', 'true', 'yes', 'on')
+
+
+def reply_handling_label(value):
+    mapping = {
+        'lead_inbox': 'Lead inbox threading',
+        'client_email': 'Client email reply-to',
+    }
+    return mapping.get(clean_reply_handling_mode(value), 'Lead inbox threading')
+
+
+def decode_email_header_value(value):
+    raw = value or ''
+    try:
+        return str(make_header(decode_header(raw))).strip()
+    except Exception:
+        return raw.strip()
+
+
+def extract_email_address(value):
+    return (parseaddr(value or '')[1] or '').strip().lower()
+
+
+def extract_message_text(message):
+    text_chunks = []
+    html_chunks = []
+    parts = message.walk() if message.is_multipart() else [message]
+    for part in parts:
+        disposition = (part.get('Content-Disposition') or '').lower()
+        if 'attachment' in disposition:
+            continue
+        content_type = (part.get_content_type() or '').lower()
+        if content_type not in ('text/plain', 'text/html'):
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or 'utf-8'
+        try:
+            decoded = payload.decode(charset, errors='replace')
+        except Exception:
+            decoded = payload.decode('utf-8', errors='replace')
+        decoded = decoded.strip()
+        if not decoded:
+            continue
+        if content_type == 'text/plain':
+            text_chunks.append(decoded)
+        else:
+            html_chunks.append(re.sub(r'<[^>]+>', ' ', decoded))
+    joined = '\n\n'.join(text_chunks or html_chunks)
+    return re.sub(r'\n{3,}', '\n\n', joined).strip()
+
+
+def imap_is_configured():
+    return bool((os.getenv('IMAP_HOST') or '').strip() and (os.getenv('IMAP_USERNAME') or '').strip() and (os.getenv('IMAP_PASSWORD') or ''))
+
+
+def notify_client_of_inbound_reply(site_data, lead, payload):
+    client_email = clean_email_value((site_data.get('reply_to_email') or '').strip())
+    platform_mailbox = ((os.getenv('MAIL_FROM') or os.getenv('SMTP_USERNAME') or '').strip()).lower()
+    if not client_email or client_email.lower() == platform_mailbox:
+        return None
+
+    lead_name = (lead.get('first_name') or payload.get('from_email') or 'Customer').strip() or 'Customer'
+    subject = f"New customer reply from {lead_name}"
+    body = [
+        f"A customer has replied to lead #{lead.get('id')}.",
+        '',
+        f"From: {payload.get('from_name') or payload.get('from_email') or 'Unknown sender'}",
+        f"Email: {payload.get('from_email') or 'Unknown email'}",
+        f"Subject: {payload.get('subject') or 'No subject'}",
+        '',
+        payload.get('body_text') or 'No message body extracted.',
+        '',
+        'This reply has also been saved to the lead timeline in LeadResponse.',
+    ]
+    notify_site = dict(site_data)
+    notify_site['reply_handling_mode'] = 'lead_inbox'
+    notify_site['reply_to_email'] = ''
+    return send_email_message(notify_site, client_email, subject, '\n'.join(body))
+
+
+def poll_inbound_replies_for_site(site):
+    site_data = row_to_dict(site) or {}
+    if not imap_is_configured() or not site_data.get('id'):
+        return 0
+
+    host = (os.getenv('IMAP_HOST') or '').strip()
+    port = int((os.getenv('IMAP_PORT') or '993').strip())
+    username = (os.getenv('IMAP_USERNAME') or '').strip()
+    password = os.getenv('IMAP_PASSWORD') or ''
+    folder = (os.getenv('IMAP_FOLDER') or 'INBOX').strip() or 'INBOX'
+    use_ssl = env_flag('IMAP_USE_SSL', True)
+    use_tls = env_flag('IMAP_USE_TLS', not use_ssl)
+    processed = 0
+
+    try:
+        if use_ssl:
+            mailbox = imaplib.IMAP4_SSL(host, port)
+        else:
+            mailbox = imaplib.IMAP4(host, port)
+            if use_tls and hasattr(mailbox, 'starttls'):
+                mailbox.starttls(ssl_context=ssl.create_default_context())
+        mailbox.login(username, password)
+        mailbox.select(folder)
+        typ, data = mailbox.search(None, 'UNSEEN')
+        message_nums = data[0].split() if typ == 'OK' and data and data[0] else []
+
+        for num in message_nums:
+            typ, fetched = mailbox.fetch(num, '(BODY.PEEK[])')
+            if typ != 'OK' or not fetched:
+                continue
+            raw_bytes = None
+            for item in fetched:
+                if isinstance(item, tuple) and len(item) > 1 and item[1]:
+                    raw_bytes = item[1]
+                    break
+            if not raw_bytes:
+                continue
+
+            message = email.message_from_bytes(raw_bytes)
+            sender_email = extract_email_address(message.get('From'))
+            if not sender_email:
+                continue
+
+            message_id = decode_email_header_value(message.get('Message-ID') or '').strip()
+            subject = decode_email_header_value(message.get('Subject') or '').strip()
+            body_text = extract_message_text(message)
+            sent_at = decode_email_header_value(message.get('Date') or '').strip()
+            from_name = decode_email_header_value(parseaddr(message.get('From') or '')[0])
+
+            conn = connect_db()
+            try:
+                if message_id:
+                    existing = conn.execute(
+                        sql("SELECT id FROM lead_events WHERE event_type = ? AND payload_json LIKE ? LIMIT 1"),
+                        ('customer_reply_received', f'%{message_id}%')
+                    ).fetchone()
+                    if existing:
+                        mailbox.store(num, '+FLAGS', '\\Seen')
+                        continue
+
+                lead_row = conn.execute(
+                    sql('SELECT * FROM leads WHERE site_id = ? AND lower(email) = ? ORDER BY id DESC LIMIT 1'),
+                    (site_data['id'], sender_email)
+                ).fetchone()
+                if not lead_row:
+                    log_mail_event('INBOUND_REPLY_UNMATCHED', {
+                        'site_id': site_data['id'],
+                        'from_email': sender_email,
+                        'subject': subject,
+                    })
+                    continue
+
+                lead = row_to_dict(lead_row)
+                payload = {
+                    'from_name': from_name,
+                    'from_email': sender_email,
+                    'subject': subject,
+                    'body_text': body_text,
+                    'message_id': message_id,
+                    'sent_at': sent_at,
+                    'reply_via': 'imap',
+                }
+                create_lead_event(conn, site_data['id'], lead['id'], 'customer_reply_received', payload, now_iso())
+                existing_notes = (lead.get('notes') or '').strip()
+                snippet = (body_text or '').strip()
+                if len(snippet) > 700:
+                    snippet = snippet[:700] + '…'
+                note_entry = f"[{now_iso()}] Customer reply from {sender_email}: {snippet or 'No body extracted.'}"
+                new_notes = f"{existing_notes}\n\n{note_entry}".strip() if existing_notes else note_entry
+                update_lead_status(conn, lead['id'], 'open', new_notes)
+                conn.commit()
+                mailbox.store(num, '+FLAGS', '\\Seen')
+                processed += 1
+                log_mail_event('INBOUND_REPLY_MATCHED', {
+                    'site_id': site_data['id'],
+                    'lead_id': lead['id'],
+                    'from_email': sender_email,
+                    'subject': subject,
+                })
+                notification = notify_client_of_inbound_reply(site_data, lead, payload)
+                if notification:
+                    log_mail_event('INBOUND_REPLY_CLIENT_NOTIFIED', {
+                        'site_id': site_data['id'],
+                        'lead_id': lead['id'],
+                        'client_email': site_data.get('reply_to_email') or '',
+                        'ok': notification.get('ok'),
+                        'mode': notification.get('mode'),
+                    })
+            finally:
+                conn.close()
+
+        mailbox.logout()
+    except Exception as exc:
+        log_mail_event('INBOUND_REPLY_POLL_ERROR', {
+            'site_id': site_data.get('id'),
+            'error': str(exc),
+            'host': host,
+            'port': port,
+            'folder': folder,
+        })
+
+    return processed
 
 
 def parse_iso_ts(value):
@@ -1077,7 +1298,7 @@ BASE_HTML = '''
       </div>
     </div>
     {{ body|safe }}
-    <div class="footer-note">LeadResponse v0.8.2 test dashboard · Render Postgres ready</div>
+    <div class="footer-note">LeadResponse v0.8.3 test dashboard · Render Postgres ready</div>
   </div>
 </body>
 </html>
@@ -1166,6 +1387,8 @@ def dashboard():
     latest = lead_rows[0] if lead_rows else None
     widget_settings = get_widget_settings(site)
     widget_saved = (request.args.get('widget_saved') or '') == '1'
+    reply_saved = (request.args.get('reply_saved') or '') == '1'
+    current_reply_mode = clean_reply_handling_mode((row_to_dict(site) or {}).get('reply_handling_mode') or 'lead_inbox', 'lead_inbox')
 
     body = render_template_string('''
     <section class="hero">
@@ -1183,6 +1406,9 @@ def dashboard():
     {% if widget_saved %}
       <div class="notice-success">Widget settings updated successfully.</div>
     {% endif %}
+    {% if reply_saved %}
+      <div class="notice-success">Reply handling updated successfully.</div>
+    {% endif %}
 
     <div class="stack">
       <section class="panel">
@@ -1199,6 +1425,35 @@ def dashboard():
           <span class="pill neutral">Booking URL: {{ site['booking_url'] or 'Not set' }}</span>
           <span class="pill neutral">Lost: {{ lost_leads }}</span>
         </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>Reply handling</h2>
+            <p>Choose whether customer replies go straight to the client email or stay in the LeadResponse mailbox and get attached to the matching lead.</p>
+          </div>
+        </div>
+        <div class="meta">
+          <span class="pill neutral">Mode: {{ reply_handling_label(current_reply_mode) }}</span>
+          <span class="pill neutral">Client reply email: {{ site['reply_to_email'] or 'Not set' }}</span>
+          <span class="pill neutral">IMAP ingest: {{ 'Enabled' if imap_configured else 'Not configured' }}</span>
+        </div>
+        <form method="post" action="{{ url_for('save_reply_routing', site_id=site['id']) }}?site_token={{ site['site_token'] }}" class="admin-form" style="margin-top:18px;">
+          <label>
+            Reply handling mode
+            <select name="reply_handling_mode">
+              <option value="lead_inbox" {% if current_reply_mode == 'lead_inbox' %}selected{% endif %}>Lead inbox threading (recommended)</option>
+              <option value="client_email" {% if current_reply_mode == 'client_email' %}selected{% endif %}>Direct to client email</option>
+            </select>
+          </label>
+          <label>
+            Client reply email
+            <input type="email" name="reply_to_email" value="{{ site['reply_to_email'] or '' }}" placeholder="owner@example.com">
+          </label>
+          <button type="submit">Save reply handling</button>
+        </form>
+        <p class="muted" style="margin-top:12px;">Lead inbox threading keeps the platform mailbox as the reply destination and pulls inbound replies into lead events using IMAP. Direct to client email sets Reply-To so replies bypass the platform and go straight to the client inbox.</p>
       </section>
 
       <section class="panel">
@@ -1281,7 +1536,7 @@ def dashboard():
         </div>
       </section>
     </div>
-    ''', site=site, lead_rows=lead_rows, total_leads=total_leads, new_leads=new_leads, open_leads=open_leads, won_leads=won_leads, lost_leads=lost_leads, latest=latest, sites=sites, fmt_dt=fmt_dt, label_urgency=label_urgency, status_filter=status_filter, widget_settings=widget_settings, widget_fields=WIDGET_SETTINGS_FIELDS, widget_saved=widget_saved)
+    ''', site=site, lead_rows=lead_rows, total_leads=total_leads, new_leads=new_leads, open_leads=open_leads, won_leads=won_leads, lost_leads=lost_leads, latest=latest, sites=sites, fmt_dt=fmt_dt, label_urgency=label_urgency, status_filter=status_filter, widget_settings=widget_settings, widget_fields=WIDGET_SETTINGS_FIELDS, widget_saved=widget_saved, reply_saved=reply_saved, current_reply_mode=current_reply_mode, reply_handling_label=reply_handling_label, imap_configured=imap_is_configured())
 
     return render_page(body, title='LeadResponse Lead Inbox', current_site=site)
 
@@ -1434,6 +1689,37 @@ def lead_update_page(lead_id):
     conn.commit()
 
     return redirect(url_for('lead_detail_page', lead_id=lead_id, site_token=site['site_token'], updated='1'))
+
+
+@app.route('/dashboard/sites/<int:site_id>/reply-routing/save', methods=['POST'])
+def save_reply_routing(site_id):
+    site_token = (request.args.get('site_token') or '').strip()
+    site = get_site_by_token(site_token) if site_token else None
+    if not site or site['id'] != site_id:
+        site = db().execute(sql('SELECT * FROM sites WHERE id = ?'), (site_id,)).fetchone()
+    if not site:
+        return redirect(url_for('dashboard'))
+
+    reply_to_email = clean_email_value(request.form.get('reply_to_email') or '')
+    reply_handling_mode = clean_reply_handling_mode(request.form.get('reply_handling_mode') or 'lead_inbox', 'lead_inbox')
+    if reply_handling_mode == 'client_email' and not reply_to_email:
+        reply_handling_mode = 'lead_inbox'
+
+    updated_at = now_iso()
+    conn = db()
+    conn.execute(
+        sql('UPDATE sites SET reply_to_email = ?, reply_handling_mode = ?, updated_at = ? WHERE id = ?'),
+        (reply_to_email, reply_handling_mode, updated_at, site_id)
+    )
+    conn.execute(
+        sql('INSERT INTO lead_events (site_id, lead_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)'),
+        (site_id, None, 'reply_routing_updated', json.dumps({'reply_to_email': reply_to_email, 'reply_handling_mode': reply_handling_mode}), updated_at)
+    )
+    conn.commit()
+
+    refreshed = db().execute(sql('SELECT * FROM sites WHERE id = ?'), (site_id,)).fetchone()
+    refreshed_token = refreshed['site_token'] if refreshed and refreshed['site_token'] else site_token
+    return redirect(url_for('dashboard', site_token=refreshed_token, reply_saved='1'))
 
 
 @app.route('/dashboard/sites/<int:site_id>/widget-settings/save', methods=['POST'])
@@ -1863,6 +2149,7 @@ def run_automation_api():
     processed = 0
     follow_ups_sent = 0
     no_response_marked = 0
+    replies_ingested = 0
     conn = db()
 
     for row in rows:
@@ -1902,11 +2189,13 @@ def run_automation_api():
             no_response_marked += 1
 
     conn.commit()
+    replies_ingested = poll_inbound_replies_for_site(site_data)
     return jsonify({
         'success': True,
         'processed': processed,
         'follow_ups_sent': follow_ups_sent,
         'no_response_marked': no_response_marked,
+        'replies_ingested': replies_ingested,
         'message': 'Website follow-up engine run completed.'
     })
 
