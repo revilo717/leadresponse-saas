@@ -2183,6 +2183,25 @@ def get_lead(lead_id):
     })
 
 
+@app.route('/api/v1/leads/<int:lead_id>/delete', methods=['POST'])
+def delete_lead_api(lead_id):
+    payload = request.get_json(silent=True) or {}
+    site_token = (payload.get('site_token') or '').strip()
+    site = get_site_by_token(site_token)
+    if not site:
+        return jsonify({'error': 'Invalid site token.'}), 404
+
+    lead = db().execute(sql('SELECT * FROM leads WHERE id = ? AND site_id = ?'), (lead_id, site['id'])).fetchone()
+    if not lead:
+        return jsonify({'error': 'Lead not found.'}), 404
+
+    conn = db()
+    conn.execute(sql('DELETE FROM lead_events WHERE lead_id = ? AND site_id = ?'), (lead_id, site['id']))
+    conn.execute(sql('DELETE FROM leads WHERE id = ? AND site_id = ?'), (lead_id, site['id']))
+    conn.commit()
+    return jsonify({'success': True, 'deleted_lead_id': lead_id})
+
+
 @app.route('/api/v1/leads/<int:lead_id>/update', methods=['POST'])
 def update_lead_api(lead_id):
     payload = request.get_json(silent=True) or {}
