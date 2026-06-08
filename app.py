@@ -2064,6 +2064,77 @@ def lead_events():
     })
 
 
+
+def summarize_timeline_payload(payload):
+    payload = payload or {}
+    if not isinstance(payload, dict):
+        return str(payload)
+    for key in ('body_text', 'message', 'subject', 'notes', 'error'):
+        value = (payload.get(key) or '').strip() if isinstance(payload.get(key), str) else payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    status = (payload.get('status') or '').strip() if isinstance(payload.get('status'), str) else ''
+    if status:
+        return f"Status changed to {status}."
+    return ''
+
+
+def enrich_lead_for_inbox(lead):
+    lead = dict(lead or {})
+    lead_id = lead.get('id')
+    if not lead_id:
+        lead['reply_count'] = 0
+        lead['latest_reply_at'] = ''
+        lead['latest_reply_preview'] = ''
+        lead['latest_event_type'] = ''
+        lead['latest_event_at'] = lead.get('created_at') or ''
+        lead['latest_activity_at'] = lead.get('created_at') or ''
+        return lead
+
+    reply_count = 0
+    latest_reply = latest_event_for_lead(lead_id, 'customer_reply_received') or {}
+    try:
+        reply_count_row = db().execute(
+            sql('SELECT COUNT(*) AS reply_count FROM lead_events WHERE lead_id = ? AND event_type = ?'),
+            (lead_id, 'customer_reply_received')
+        ).fetchone()
+        if reply_count_row is not None:
+            reply_count = int((row_to_dict(reply_count_row).get('reply_count') or 0))
+    except Exception:
+        reply_count = 0
+
+    latest_event = db().execute(
+        sql('SELECT * FROM lead_events WHERE lead_id = ? ORDER BY id DESC LIMIT 1'),
+        (lead_id,)
+    ).fetchone()
+    latest_event_dict = row_to_dict(latest_event)
+    latest_reply_payload = parse_payload(latest_reply.get('payload_json')) if latest_reply else {}
+    latest_reply_preview = summarize_timeline_payload(latest_reply_payload)
+    if len(latest_reply_preview) > 220:
+        latest_reply_preview = latest_reply_preview[:220] + '…'
+
+    lead['reply_count'] = reply_count
+    lead['latest_reply_at'] = latest_reply.get('created_at') or ''
+    lead['latest_reply_preview'] = latest_reply_preview
+    lead['latest_event_type'] = latest_event_dict.get('event_type') or ''
+    lead['latest_event_at'] = latest_event_dict.get('created_at') or lead.get('created_at') or ''
+    lead['latest_activity_at'] = latest_reply.get('created_at') or latest_event_dict.get('created_at') or lead.get('created_at') or ''
+    return lead
+
+
+def lead_timeline_for_api(lead_id, limit=50):
+    rows = db().execute(
+        sql('SELECT * FROM lead_events WHERE lead_id = ? ORDER BY id DESC LIMIT ?'),
+        (lead_id, int(limit))
+    ).fetchall()
+    events = []
+    for row in rows:
+        event = row_to_dict(row)
+        event['payload'] = parse_payload(event.get('payload_json'))
+        events.append(event)
+    return events
+
+
 @app.route('/api/v1/leads', methods=['GET'])
 def list_leads():
     site_token = (request.args.get('site_token') or '').strip()
@@ -2079,15 +2150,37 @@ def list_leads():
         params.append(status_filter)
     query += ' ORDER BY id DESC LIMIT 100'
     rows = db().execute(sql(query), params).fetchall()
-    return jsonify({'items': [row_to_dict(r) for r in rows]})
+    items = [enrich_lead_for_inbox(row_to_dict(r)) for r in rows]
+    return jsonify({'items': items})
 
 
 @app.route('/api/v1/leads/<int:lead_id>', methods=['GET'])
 def get_lead(lead_id):
-    row = db().execute(sql('SELECT * FROM leads WHERE id = ?'), (lead_id,)).fetchone()
+    site_token = (request.args.get('site_token') or '').strip()
+    include_events = (request.args.get('include_events') or '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+    params = [lead_id]
+    query = 'SELECT * FROM leads WHERE id = ?'
+    if site_token:
+        site = get_site_by_token(site_token)
+        if not site:
+            return jsonify({'error': 'Invalid site token.'}), 404
+        query += ' AND site_id = ?'
+        params.append(site['id'])
+
+    row = db().execute(sql(query), params).fetchone()
     if not row:
         return jsonify({'error': 'Lead not found.'}), 404
-    return jsonify(row_to_dict(row))
+
+    lead = enrich_lead_for_inbox(row_to_dict(row))
+    if not include_events:
+        return jsonify(lead)
+
+    events = lead_timeline_for_api(lead_id, 60)
+    return jsonify({
+        'item': lead,
+        'events': events,
+    })
 
 
 @app.route('/api/v1/leads/<int:lead_id>/update', methods=['POST'])
