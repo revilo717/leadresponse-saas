@@ -1229,7 +1229,7 @@ def outbound_message_ids_from_payload(payload):
     return values
 
 
-def recent_outbound_thread_events(conn, site_id, recipient_email, limit=800):
+def recent_outbound_thread_events(conn, site_id, recipient_email=None, limit=800):
     rows = conn.execute(
         sql('SELECT * FROM lead_events WHERE site_id = ? ORDER BY id DESC LIMIT ?'),
         (site_id, int(limit))
@@ -1251,17 +1251,26 @@ def recent_outbound_thread_events(conn, site_id, recipient_email, limit=800):
 def find_lead_by_thread_headers(conn, site_id, sender_email, in_reply_to, references):
     reference_ids = set(extract_header_message_ids(in_reply_to) + extract_header_message_ids(references))
     if not reference_ids:
-        return None, ''
-    for event in recent_outbound_thread_events(conn, site_id, sender_email):
+        return None, 'no_thread_headers'
+
+    thread_matches = []
+    for event in recent_outbound_thread_events(conn, site_id, None):
         outbound_ids = set(outbound_message_ids_from_payload(event.get('payload')))
         if outbound_ids and reference_ids.intersection(outbound_ids):
-            lead_row = conn.execute(
-                sql('SELECT * FROM leads WHERE id = ? AND site_id = ? LIMIT 1'),
-                (event.get('lead_id'), site_id)
-            ).fetchone()
-            if lead_row:
-                return lead_row, 'thread_headers'
-    return None, ''
+            lead_id = int(event.get('lead_id') or 0)
+            if lead_id and lead_id not in thread_matches:
+                thread_matches.append(lead_id)
+
+    if len(thread_matches) != 1:
+        return None, 'ambiguous_thread_match' if thread_matches else 'no_thread_header_match'
+
+    lead_row = conn.execute(
+        sql('SELECT * FROM leads WHERE id = ? AND site_id = ? LIMIT 1'),
+        (thread_matches[0], site_id)
+    ).fetchone()
+    if lead_row:
+        return lead_row, 'thread_headers'
+    return None, 'thread_header_lead_not_found'
 
 
 def find_lead_by_safe_fallback(conn, site_id, sender_email, subject, sent_at):
@@ -1309,7 +1318,12 @@ def resolve_inbound_reply_lead(conn, site_id, sender_email, subject, in_reply_to
     lead_row, matched_via = find_lead_by_thread_headers(conn, site_id, sender_email, in_reply_to, references)
     if lead_row:
         return lead_row, matched_via
-    return find_lead_by_safe_fallback(conn, site_id, sender_email, subject, sent_at)
+    fallback_row, fallback_reason = find_lead_by_safe_fallback(conn, site_id, sender_email, subject, sent_at)
+    if fallback_row:
+        return fallback_row, fallback_reason
+    if matched_via:
+        return None, matched_via
+    return None, fallback_reason
 
 
 def save_reply_sync_status(site_id, checked_at, replies_ingested=0, error=''):
@@ -1428,6 +1442,7 @@ def poll_inbound_replies_for_site(site):
                         'folder': folder,
                         'in_reply_to': in_reply_to,
                         'references': references,
+                        'unmatched_reason': matched_via or 'unknown',
                     })
                     continue
 
