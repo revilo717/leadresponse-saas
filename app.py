@@ -7,7 +7,8 @@ import imaplib
 import email
 import re
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import hashlib
 from urllib.parse import urlparse
 import smtplib
 import ssl
@@ -989,6 +990,41 @@ def notify_client_of_inbound_reply(site_data, lead, payload):
     return send_email_message(notify_site, client_email, subject, '\n'.join(body))
 
 
+def inbound_reply_fingerprint(sender_email, subject, body_text, sent_at):
+    normalized = '|'.join([
+        (sender_email or '').strip().lower(),
+        re.sub(r'\s+', ' ', (subject or '').strip().lower()),
+        re.sub(r'\s+', ' ', (body_text or '').strip().lower())[:500],
+        (sent_at or '').strip().lower(),
+    ])
+    return hashlib.sha1(normalized.encode('utf-8', errors='ignore')).hexdigest()
+
+
+def recent_imap_search_keys(lookback_days=7):
+    try:
+        days = int(lookback_days or 7)
+    except Exception:
+        days = 7
+    days = max(1, min(days, 30))
+    since_dt = datetime.now(timezone.utc) - timedelta(days=days)
+    since_token = since_dt.strftime('%d-%b-%Y')
+    return [
+        ['SINCE', since_token],
+        ['ALL'],
+    ]
+
+
+def fetch_recent_imap_message_numbers(mailbox, lookback_days=7):
+    for keys in recent_imap_search_keys(lookback_days):
+        try:
+            typ, data = mailbox.search(None, *keys)
+        except Exception:
+            continue
+        if typ == 'OK' and data and data[0]:
+            return data[0].split()
+    return []
+
+
 def save_reply_sync_status(site_id, checked_at, replies_ingested=0, error=''):
     if not site_id:
         return
@@ -1029,6 +1065,7 @@ def poll_inbound_replies_for_site(site):
     folder = (os.getenv('IMAP_FOLDER') or 'INBOX').strip() or 'INBOX'
     use_ssl = env_flag('IMAP_USE_SSL', True)
     use_tls = env_flag('IMAP_USE_TLS', not use_ssl)
+    lookback_days = int((os.getenv('IMAP_LOOKBACK_DAYS') or '7').strip() or '7')
     processed = 0
 
     try:
@@ -1040,8 +1077,7 @@ def poll_inbound_replies_for_site(site):
                 mailbox.starttls(ssl_context=ssl.create_default_context())
         mailbox.login(username, password)
         mailbox.select(folder)
-        typ, data = mailbox.search(None, 'UNSEEN')
-        message_nums = data[0].split() if typ == 'OK' and data and data[0] else []
+        message_nums = fetch_recent_imap_message_numbers(mailbox, lookback_days)
 
         for num in message_nums:
             typ, fetched = mailbox.fetch(num, '(BODY.PEEK[])')
@@ -1065,17 +1101,23 @@ def poll_inbound_replies_for_site(site):
             body_text = extract_message_text(message)
             sent_at = decode_email_header_value(message.get('Date') or '').strip()
             from_name = decode_email_header_value(parseaddr(message.get('From') or '')[0])
+            reply_fingerprint = inbound_reply_fingerprint(sender_email, subject, body_text, sent_at)
 
             conn = connect_db()
             try:
+                duplicate = None
                 if message_id:
-                    existing = conn.execute(
+                    duplicate = conn.execute(
                         sql("SELECT id FROM lead_events WHERE event_type = ? AND payload_json LIKE ? LIMIT 1"),
                         ('customer_reply_received', f'%{message_id}%')
                     ).fetchone()
-                    if existing:
-                        mailbox.store(num, '+FLAGS', '\\Seen')
-                        continue
+                if not duplicate and reply_fingerprint:
+                    duplicate = conn.execute(
+                        sql("SELECT id FROM lead_events WHERE event_type = ? AND payload_json LIKE ? LIMIT 1"),
+                        ('customer_reply_received', f'%{reply_fingerprint}%')
+                    ).fetchone()
+                if duplicate:
+                    continue
 
                 lead_row = conn.execute(
                     sql('SELECT * FROM leads WHERE site_id = ? AND lower(email) = ? ORDER BY id DESC LIMIT 1'),
@@ -1086,6 +1128,7 @@ def poll_inbound_replies_for_site(site):
                         'site_id': site_data['id'],
                         'from_email': sender_email,
                         'subject': subject,
+                        'folder': folder,
                     })
                     continue
 
@@ -1096,8 +1139,10 @@ def poll_inbound_replies_for_site(site):
                     'subject': subject,
                     'body_text': body_text,
                     'message_id': message_id,
+                    'reply_fingerprint': reply_fingerprint,
                     'sent_at': sent_at,
                     'reply_via': 'imap',
+                    'imap_folder': folder,
                 }
                 create_lead_event(conn, site_data['id'], lead['id'], 'customer_reply_received', payload, now_iso())
                 existing_notes = (lead.get('notes') or '').strip()
@@ -1108,13 +1153,13 @@ def poll_inbound_replies_for_site(site):
                 new_notes = f"{existing_notes}\n\n{note_entry}".strip() if existing_notes else note_entry
                 update_lead_status(conn, lead['id'], 'open', new_notes)
                 conn.commit()
-                mailbox.store(num, '+FLAGS', '\\Seen')
                 processed += 1
                 log_mail_event('INBOUND_REPLY_MATCHED', {
                     'site_id': site_data['id'],
                     'lead_id': lead['id'],
                     'from_email': sender_email,
                     'subject': subject,
+                    'folder': folder,
                 })
                 notification = notify_client_of_inbound_reply(site_data, lead, payload)
                 if notification:
@@ -1141,6 +1186,7 @@ def poll_inbound_replies_for_site(site):
             'host': host,
             'port': port,
             'folder': folder,
+            'lookback_days': lookback_days,
         })
         save_reply_sync_status(site_data['id'], checked_at, 0, str(exc))
 
