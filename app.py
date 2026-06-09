@@ -112,6 +112,18 @@ WHITE_LABEL_DEFAULTS = {
     'smtp_use_tls': 1,
 }
 
+EMAIL_TEMPLATE_DEFAULTS = {
+    'use_global_email_templates': 1,
+    'ack_subject_template': 'Thanks {{first_name}} — we received your enquiry',
+    'ack_body_template': 'Hi {{first_name}},\n\nThanks for contacting {{site_name}}. We have received your enquiry and the details below have been captured:\n\nService: {{service_type}}\nPostcode: {{postcode}}\nUrgency: {{urgency}}\n\nWe will review this and follow up with the next step shortly.\n\n{{booking_line}}\n\nRegards,\n{{site_name}}',
+    'followup_1_subject_template': '{{first_name}}, just checking on your enquiry',
+    'followup_1_body_template': 'Hi {{first_name}},\n\n{{follow_up_intro}}\n\nService: {{service_type}}\nPostcode: {{postcode}}\nUrgency: {{urgency}}\n\n{{booking_line}}\n\n{{reply_prompt}}\n\nRegards,\n{{site_name}}',
+    'followup_2_subject_template': 'Quick follow-up on your enquiry',
+    'followup_2_body_template': 'Hi {{first_name}},\n\n{{follow_up_intro}}\n\nService: {{service_type}}\nPostcode: {{postcode}}\nUrgency: {{urgency}}\n\n{{booking_line}}\n\n{{reply_prompt}}\n\nRegards,\n{{site_name}}',
+    'followup_3_subject_template': 'Final follow-up before we close your enquiry',
+    'followup_3_body_template': 'Hi {{first_name}},\n\n{{follow_up_intro}}\n\nService: {{service_type}}\nPostcode: {{postcode}}\nUrgency: {{urgency}}\n\n{{booking_line}}\n\n{{reply_prompt}}\n\nRegards,\n{{site_name}}',
+}
+
 WHITE_LABEL_STATUS_VALUES = {'not_started', 'pending', 'verified', 'failed'}
 
 
@@ -349,6 +361,15 @@ def init_db():
         'smtp_password': "smtp_password TEXT",
         'smtp_use_ssl': "smtp_use_ssl INTEGER DEFAULT 0",
         'smtp_use_tls': "smtp_use_tls INTEGER DEFAULT 1",
+        'use_global_email_templates': "use_global_email_templates INTEGER DEFAULT 1",
+        'ack_subject_template': "ack_subject_template TEXT",
+        'ack_body_template': "ack_body_template TEXT",
+        'followup_1_subject_template': "followup_1_subject_template TEXT",
+        'followup_1_body_template': "followup_1_body_template TEXT",
+        'followup_2_subject_template': "followup_2_subject_template TEXT",
+        'followup_2_body_template': "followup_2_body_template TEXT",
+        'followup_3_subject_template': "followup_3_subject_template TEXT",
+        'followup_3_body_template': "followup_3_body_template TEXT",
     }
     for column_name, column_sql in site_columns.items():
         ensure_column(conn, 'sites', column_name, column_sql)
@@ -743,6 +764,12 @@ def get_white_label_settings(site):
     provider_options = email_provider_options()
     settings['provider_options'] = provider_options
     settings['email_provider_label'] = provider_options.get(settings['email_provider'], 'Custom provider / my own provider')
+    for key, default in EMAIL_TEMPLATE_DEFAULTS.items():
+        if key == 'use_global_email_templates':
+            settings[key] = 1 if coerce_bool(site_data.get(key), True) else 0
+        else:
+            settings[key] = normalize_template_text(site_data.get(key), default)
+    settings['email_template_defaults'] = dict(EMAIL_TEMPLATE_DEFAULTS)
     settings['email_dns_records'] = build_email_dns_records(settings)
     settings['email_dns_steps'] = build_email_dns_steps(settings)
     settings['dns_pack_summary'] = 'Email branding normally needs a DNS pack (TXT / CNAME / MX / DMARC), not just one CNAME.'
@@ -780,6 +807,60 @@ def public_white_label_settings(site):
     settings['smtp_password'] = ''
     settings['smtp_password_saved'] = bool(settings.get('smtp_password_saved'))
     return settings
+
+
+def normalize_template_text(value, default):
+    text = str(value if value not in (None, '') else default).replace('\r\n', '\n').replace('\r', '\n').strip()
+    return text or default
+
+
+def template_context(site, lead, step_number=None):
+    site_data = row_to_dict(site) or {}
+    lead_data = row_to_dict(lead) or {}
+    booking_url = (site_data.get('booking_url') or '').strip()
+    context = {
+        'first_name': (lead_data.get('first_name') or 'there').strip() or 'there',
+        'site_name': (site_data.get('brand_display_name') or site_data.get('name') or 'LeadResponse').strip() or 'LeadResponse',
+        'service_type': (lead_data.get('service_type') or '').strip() or 'Not provided',
+        'postcode': (lead_data.get('postcode') or '').strip() or 'Not provided',
+        'urgency': (lead_data.get('urgency') or '').strip() or 'Not provided',
+        'booking_url': booking_url,
+        'booking_line': '',
+        'follow_up_intro': '',
+        'reply_prompt': 'Reply to this email if you would like us to help.',
+    }
+    if step_number in (1, 2, 3):
+        intros = {
+            1: 'We wanted to follow up to make sure you still need help with this job.',
+            2: 'We are following up again in case you still want to move this forward.',
+            3: 'This is our final automated follow-up before we mark the enquiry as no response.',
+        }
+        context['follow_up_intro'] = intros.get(step_number, 'We are following up on your enquiry.')
+        if booking_url:
+            context['booking_line'] = f'If you are ready, book the next step here: {booking_url}'
+    elif booking_url:
+        context['booking_line'] = f'If you would prefer, you can book the next step now: {booking_url}'
+    return context
+
+
+def render_template_text(template, context):
+    text = str(template or '')
+    def repl(match):
+        key = (match.group(1) or '').strip()
+        return str(context.get(key, ''))
+    rendered = re.sub(r'{{\s*([a-z0-9_]+)\s*}}', repl, text, flags=re.IGNORECASE)
+    rendered = re.sub(r'\n{3,}', '\n\n', rendered)
+    rendered = re.sub(r'[ \t]+\n', '\n', rendered)
+    return rendered.strip()
+
+
+def effective_email_template(settings, key):
+    default = EMAIL_TEMPLATE_DEFAULTS.get(key, '')
+    if key == 'use_global_email_templates':
+        return 1 if coerce_bool(settings.get(key), True) else 0
+    if coerce_bool(settings.get('use_global_email_templates'), True):
+        return default
+    return normalize_template_text(settings.get(key), default)
 
 
 def fmt_dt(value):
@@ -1262,54 +1343,23 @@ def send_manual_lead_email(site_data, lead, subject, body_text, status_after_sen
     return {'ok': bool(mail_result.get('ok')), 'mail_result': mail_result, 'item': enrich_lead_for_inbox(row_to_dict(refreshed) or lead)}
 
 def build_ack_email(site, lead):
-    site_name = (site.get('name') or 'LeadResponse') if isinstance(site, dict) else (site['name'] or 'LeadResponse')
-    lead_name = (lead.get('first_name') or 'there').strip() or 'there'
-    booking_url = (site.get('booking_url') or '') if isinstance(site, dict) else (site['booking_url'] or '')
-    subject = f'Thanks {lead_name} — we received your enquiry'
-    body = [
-        f'Hi {lead_name},',
-        '',
-        f'Thanks for contacting {site_name}. We have received your enquiry and the details below have been captured:',
-        '',
-        f"Service: {(lead.get('service_type') or '').strip() or 'Not provided'}",
-        f"Postcode: {(lead.get('postcode') or '').strip() or 'Not provided'}",
-        f"Urgency: {(lead.get('urgency') or '').strip() or 'Not provided'}",
-        '',
-        'We will review this and follow up with the next step shortly.'
-    ]
-    if booking_url:
-        body.extend(['', f'If you would prefer, you can book the next step now: {booking_url}'])
-    body.extend(['', 'Regards,', site_name])
-    return subject, '\n'.join(body)
+    settings = get_white_label_settings(site)
+    context = template_context(settings, lead)
+    subject = render_template_text(effective_email_template(settings, 'ack_subject_template'), context)
+    body = render_template_text(effective_email_template(settings, 'ack_body_template'), context)
+    return subject or render_template_text(EMAIL_TEMPLATE_DEFAULTS['ack_subject_template'], context), body or render_template_text(EMAIL_TEMPLATE_DEFAULTS['ack_body_template'], context)
 
 
 def build_follow_up_email(site, lead, step_number):
-    site_name = (site.get('name') or 'LeadResponse') if isinstance(site, dict) else (site['name'] or 'LeadResponse')
-    lead_name = (lead.get('first_name') or 'there').strip() or 'there'
-    booking_url = (site.get('booking_url') or '') if isinstance(site, dict) else (site['booking_url'] or '')
-    subjects = {
-        1: f'{lead_name}, just checking on your enquiry',
-        2: f'Quick follow-up on your enquiry',
-        3: f'Final follow-up before we close your enquiry',
-    }
-    intros = {
-        1: 'We wanted to follow up to make sure you still need help with this job.',
-        2: 'We are following up again in case you still want to move this forward.',
-        3: 'This is our final automated follow-up before we mark the enquiry as no response.',
-    }
-    body = [
-        f'Hi {lead_name},',
-        '',
-        intros.get(step_number, 'We are following up on your enquiry.'),
-        '',
-        f"Service: {(lead.get('service_type') or '').strip() or 'Not provided'}",
-        f"Postcode: {(lead.get('postcode') or '').strip() or 'Not provided'}",
-        f"Urgency: {(lead.get('urgency') or '').strip() or 'Not provided'}",
-    ]
-    if booking_url:
-        body.extend(['', f'If you are ready, book the next step here: {booking_url}'])
-    body.extend(['', 'Reply to this email if you would like us to help.', '', 'Regards,', site_name])
-    return subjects.get(step_number, 'LeadResponse follow-up'), '\n'.join(body)
+    settings = get_white_label_settings(site)
+    context = template_context(settings, lead, step_number)
+    subject_key = f'followup_{step_number}_subject_template'
+    body_key = f'followup_{step_number}_body_template'
+    fallback_subject = EMAIL_TEMPLATE_DEFAULTS.get(subject_key, 'LeadResponse follow-up')
+    fallback_body = EMAIL_TEMPLATE_DEFAULTS.get(body_key, EMAIL_TEMPLATE_DEFAULTS['followup_1_body_template'])
+    subject = render_template_text(effective_email_template(settings, subject_key), context)
+    body = render_template_text(effective_email_template(settings, body_key), context)
+    return subject or render_template_text(fallback_subject, context), body or render_template_text(fallback_body, context)
 
 
 BASE_HTML = '''
@@ -2105,12 +2155,21 @@ def update_white_label_settings_api():
     portal_domain_status = normalize_white_label_status(payload.get('portal_domain_status'), existing.get('portal_domain_status') or 'not_started')
     email_domain_status = normalize_white_label_status(payload.get('email_domain_status'), existing.get('email_domain_status') or 'not_started')
     dns_last_checked_at = (payload.get('dns_last_checked_at') or existing.get('dns_last_checked_at') or '').strip()
+    use_global_email_templates = 1 if coerce_bool(payload.get('use_global_email_templates'), existing.get('use_global_email_templates', True)) else 0
+    ack_subject_template = normalize_template_text(payload.get('ack_subject_template') if 'ack_subject_template' in payload else existing.get('ack_subject_template'), EMAIL_TEMPLATE_DEFAULTS['ack_subject_template'])
+    ack_body_template = normalize_template_text(payload.get('ack_body_template') if 'ack_body_template' in payload else existing.get('ack_body_template'), EMAIL_TEMPLATE_DEFAULTS['ack_body_template'])
+    followup_1_subject_template = normalize_template_text(payload.get('followup_1_subject_template') if 'followup_1_subject_template' in payload else existing.get('followup_1_subject_template'), EMAIL_TEMPLATE_DEFAULTS['followup_1_subject_template'])
+    followup_1_body_template = normalize_template_text(payload.get('followup_1_body_template') if 'followup_1_body_template' in payload else existing.get('followup_1_body_template'), EMAIL_TEMPLATE_DEFAULTS['followup_1_body_template'])
+    followup_2_subject_template = normalize_template_text(payload.get('followup_2_subject_template') if 'followup_2_subject_template' in payload else existing.get('followup_2_subject_template'), EMAIL_TEMPLATE_DEFAULTS['followup_2_subject_template'])
+    followup_2_body_template = normalize_template_text(payload.get('followup_2_body_template') if 'followup_2_body_template' in payload else existing.get('followup_2_body_template'), EMAIL_TEMPLATE_DEFAULTS['followup_2_body_template'])
+    followup_3_subject_template = normalize_template_text(payload.get('followup_3_subject_template') if 'followup_3_subject_template' in payload else existing.get('followup_3_subject_template'), EMAIL_TEMPLATE_DEFAULTS['followup_3_subject_template'])
+    followup_3_body_template = normalize_template_text(payload.get('followup_3_body_template') if 'followup_3_body_template' in payload else existing.get('followup_3_body_template'), EMAIL_TEMPLATE_DEFAULTS['followup_3_body_template'])
     updated_at = now_iso()
 
     conn = db()
     conn.execute(
-        sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, email_provider = ?, email_from_localpart = ?, reply_to_email = ?, reply_handling_mode = ?, delivery_mode = ?, sender_name = ?, sender_email = ?, transport_mode = ?, smtp_host = ?, smtp_port = ?, smtp_username = ?, smtp_password = ?, smtp_use_ssl = ?, smtp_use_tls = ?, updated_at = ? WHERE id = ?'),
-        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, dns_last_checked_at, email_provider, email_from_localpart, reply_to_email, reply_handling_mode, delivery_mode, sender_name, sender_email, transport_mode, smtp_host, smtp_port, smtp_username, smtp_password, smtp_use_ssl, smtp_use_tls, updated_at, site['id'])
+        sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, email_provider = ?, email_from_localpart = ?, reply_to_email = ?, reply_handling_mode = ?, delivery_mode = ?, sender_name = ?, sender_email = ?, transport_mode = ?, smtp_host = ?, smtp_port = ?, smtp_username = ?, smtp_password = ?, smtp_use_ssl = ?, smtp_use_tls = ?, use_global_email_templates = ?, ack_subject_template = ?, ack_body_template = ?, followup_1_subject_template = ?, followup_1_body_template = ?, followup_2_subject_template = ?, followup_2_body_template = ?, followup_3_subject_template = ?, followup_3_body_template = ?, updated_at = ? WHERE id = ?'),
+        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, dns_last_checked_at, email_provider, email_from_localpart, reply_to_email, reply_handling_mode, delivery_mode, sender_name, sender_email, transport_mode, smtp_host, smtp_port, smtp_username, smtp_password, smtp_use_ssl, smtp_use_tls, use_global_email_templates, ack_subject_template, ack_body_template, followup_1_subject_template, followup_1_body_template, followup_2_subject_template, followup_2_body_template, followup_3_subject_template, followup_3_body_template, updated_at, site['id'])
     )
     create_lead_event(conn, site['id'], None, 'white_label_settings_updated', {
         'white_label_enabled': bool(white_label_enabled),
@@ -2134,6 +2193,8 @@ def update_white_label_settings_api():
         'smtp_use_ssl': bool(smtp_use_ssl),
         'smtp_use_tls': bool(smtp_use_tls),
         'dns_last_checked_at': dns_last_checked_at,
+        'use_global_email_templates': bool(use_global_email_templates),
+        'email_template_overrides_active': not bool(use_global_email_templates),
     }, updated_at)
     conn.commit()
 
