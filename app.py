@@ -100,6 +100,9 @@ WHITE_LABEL_DEFAULTS = {
     'email_from_localpart': 'hello',
     'reply_to_email': '',
     'reply_handling_mode': 'lead_inbox',
+    'delivery_mode': 'platform_domain',
+    'sender_name': '',
+    'sender_email': '',
 }
 
 WHITE_LABEL_STATUS_VALUES = {'not_started', 'pending', 'verified', 'failed'}
@@ -329,6 +332,9 @@ def init_db():
         'email_from_localpart': "email_from_localpart TEXT DEFAULT 'hello'",
         'reply_to_email': "reply_to_email TEXT",
         'reply_handling_mode': "reply_handling_mode TEXT DEFAULT 'lead_inbox'",
+        'delivery_mode': "delivery_mode TEXT DEFAULT 'platform_domain'",
+        'sender_name': "sender_name TEXT",
+        'sender_email': "sender_email TEXT",
     }
     for column_name, column_sql in site_columns.items():
         ensure_column(conn, 'sites', column_name, column_sql)
@@ -666,6 +672,9 @@ def get_white_label_settings(site):
     settings['email_from_localpart'] = clean_localpart(site_data.get('email_from_localpart') or 'hello', 'hello')
     settings['reply_to_email'] = clean_email_value(site_data.get('reply_to_email') or '')
     settings['reply_handling_mode'] = clean_reply_handling_mode(site_data.get('reply_handling_mode') or 'lead_inbox', 'lead_inbox')
+    requested_mode = (site_data.get('delivery_mode') or settings.get('delivery_mode') or 'platform_domain').strip() or 'platform_domain'
+    settings['sender_name'] = (site_data.get('sender_name') or '').strip()
+    settings['sender_email'] = clean_email_value(site_data.get('sender_email') or '')
     settings['dns_last_checked_at'] = (site_data.get('dns_last_checked_at') or '').strip()
     settings['portal_domain'] = f"{settings['portal_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
     settings['email_domain'] = f"{settings['email_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
@@ -674,9 +683,19 @@ def get_white_label_settings(site):
     settings['platform_from_name'] = (os.getenv('MAIL_FROM_NAME') or 'LeadResponse').strip()
     settings['branded_sender_email'] = f"{settings['email_from_localpart']}@{settings['email_domain']}" if settings['email_domain'] else ''
     branded_ready = settings['white_label_enabled'] and settings['email_domain_status'] == 'verified' and bool(settings['branded_sender_email'])
-    settings['delivery_mode'] = 'branded_domain' if branded_ready else 'platform_domain'
-    settings['active_from_email'] = settings['branded_sender_email'] if branded_ready else settings['platform_from_email']
-    settings['active_from_name'] = settings['brand_display_name'] if branded_ready else settings['platform_from_name']
+    personal_ready = bool(settings['sender_email'])
+    if requested_mode == 'personal_mailbox' and personal_ready:
+        settings['delivery_mode'] = 'personal_mailbox'
+        settings['active_from_email'] = settings['sender_email']
+        settings['active_from_name'] = settings['sender_name'] or settings['brand_display_name'] or settings['platform_from_name']
+    elif requested_mode == 'branded_domain' and branded_ready:
+        settings['delivery_mode'] = 'branded_domain'
+        settings['active_from_email'] = settings['branded_sender_email']
+        settings['active_from_name'] = settings['brand_display_name'] or settings['platform_from_name']
+    else:
+        settings['delivery_mode'] = 'platform_domain'
+        settings['active_from_email'] = settings['platform_from_email']
+        settings['active_from_name'] = settings['platform_from_name']
     settings['mail_from_name'] = settings['active_from_name']
     settings['portal_dns_record'] = {
         'host': settings['portal_subdomain'],
@@ -1137,6 +1156,47 @@ def send_ack_email_async(site_data, lead, site_id, lead_id):
         log_mail_event('AUTO_ACK_FAILED', {'site_id': site_id, 'lead_id': lead_id, **payload})
         persist_mail_event_async(site_id, lead_id, 'auto_ack_failed', payload)
 
+
+
+
+def send_manual_lead_email(site_data, lead, subject, body_text, status_after_send='open'):
+    lead = dict(lead or {})
+    recipient = (lead.get('email') or '').strip()
+    if not recipient:
+        return {'ok': False, 'mode': 'skipped', 'error': 'Lead has no email address.'}
+
+    subject = (subject or '').strip()
+    body_text = (body_text or '').strip()
+    if not subject or not body_text:
+        return {'ok': False, 'mode': 'skipped', 'error': 'Subject and body are required.'}
+
+    mail_result = send_email_message(site_data, recipient, subject, body_text)
+    payload = {
+        'to': recipient,
+        'subject': subject,
+        'body_text': body_text,
+        'from_email': mail_result.get('from_email') or '',
+        'from_name': mail_result.get('from_name') or '',
+        'reply_to_email': mail_result.get('reply_to_email') or '',
+        'mode': mail_result.get('mode') or '',
+        'delivery_mode': mail_result.get('delivery_mode') or 'platform_domain',
+    }
+    if mail_result.get('error'):
+        payload['error'] = mail_result.get('error')
+
+    conn = db()
+    event_type = 'manual_email_sent' if mail_result.get('ok') else 'manual_email_failed'
+    create_lead_event(conn, site_data['id'], lead['id'], event_type, payload, now_iso())
+    if mail_result.get('ok'):
+        next_status = safe_status(status_after_send or 'open')
+        current_status = safe_status(lead.get('status') or 'new')
+        notes_value = lead.get('notes') if isinstance(lead.get('notes'), str) else ''
+        if next_status != current_status:
+            update_lead_status(conn, lead['id'], next_status, notes_value)
+            create_lead_event(conn, site_data['id'], lead['id'], 'lead_updated', {'status': next_status, 'notes': notes_value}, now_iso())
+    conn.commit()
+    refreshed = db().execute(sql('SELECT * FROM leads WHERE id = ?'), (lead['id'],)).fetchone()
+    return {'ok': bool(mail_result.get('ok')), 'mail_result': mail_result, 'item': enrich_lead_for_inbox(row_to_dict(refreshed) or lead)}
 
 def build_ack_email(site, lead):
     site_name = (site.get('name') or 'LeadResponse') if isinstance(site, dict) else (site['name'] or 'LeadResponse')
@@ -1955,6 +2015,12 @@ def update_white_label_settings_api():
     email_provider = clean_email_provider(payload.get('email_provider') or existing.get('email_provider') or 'mailgun', 'mailgun')
     email_from_localpart = clean_localpart(payload.get('email_from_localpart') or existing.get('email_from_localpart') or 'hello', 'hello')
     reply_to_email = clean_email_value(payload.get('reply_to_email') or '')
+    reply_handling_mode = clean_reply_handling_mode(payload.get('reply_handling_mode') or existing.get('reply_handling_mode') or 'lead_inbox', 'lead_inbox')
+    delivery_mode = (payload.get('delivery_mode') or existing.get('delivery_mode') or 'platform_domain').strip() or 'platform_domain'
+    if delivery_mode not in ('personal_mailbox', 'branded_domain', 'platform_domain'):
+        delivery_mode = 'platform_domain'
+    sender_name = (payload.get('sender_name') or existing.get('sender_name') or '').strip()
+    sender_email = clean_email_value(payload.get('sender_email') or existing.get('sender_email') or '')
     portal_domain_status = normalize_white_label_status(payload.get('portal_domain_status'), existing.get('portal_domain_status') or 'not_started')
     email_domain_status = normalize_white_label_status(payload.get('email_domain_status'), existing.get('email_domain_status') or 'not_started')
     dns_last_checked_at = (payload.get('dns_last_checked_at') or existing.get('dns_last_checked_at') or '').strip()
@@ -1962,8 +2028,8 @@ def update_white_label_settings_api():
 
     conn = db()
     conn.execute(
-        sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, email_provider = ?, email_from_localpart = ?, reply_to_email = ?, updated_at = ? WHERE id = ?'),
-        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, dns_last_checked_at, email_provider, email_from_localpart, reply_to_email, updated_at, site['id'])
+        sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, email_provider = ?, email_from_localpart = ?, reply_to_email = ?, reply_handling_mode = ?, delivery_mode = ?, sender_name = ?, sender_email = ?, updated_at = ? WHERE id = ?'),
+        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, dns_last_checked_at, email_provider, email_from_localpart, reply_to_email, reply_handling_mode, delivery_mode, sender_name, sender_email, updated_at, site['id'])
     )
     create_lead_event(conn, site['id'], None, 'white_label_settings_updated', {
         'white_label_enabled': bool(white_label_enabled),
@@ -1975,6 +2041,10 @@ def update_white_label_settings_api():
         'email_provider': email_provider,
         'email_from_localpart': email_from_localpart,
         'reply_to_email': reply_to_email,
+        'reply_handling_mode': reply_handling_mode,
+        'delivery_mode': delivery_mode,
+        'sender_name': sender_name,
+        'sender_email': sender_email,
         'dns_last_checked_at': dns_last_checked_at,
     }, updated_at)
     conn.commit()
@@ -2200,6 +2270,25 @@ def delete_lead_api(lead_id):
     conn.execute(sql('DELETE FROM leads WHERE id = ? AND site_id = ?'), (lead_id, site['id']))
     conn.commit()
     return jsonify({'success': True, 'deleted_lead_id': lead_id})
+
+
+@app.route('/api/v1/leads/<int:lead_id>/send-email', methods=['POST'])
+def send_manual_lead_email_api(lead_id):
+    payload = request.get_json(silent=True) or {}
+    site_token = (payload.get('site_token') or '').strip()
+    site = get_site_by_token(site_token)
+    if not site:
+        return jsonify({'error': 'Invalid site token.'}), 404
+
+    lead_row = db().execute(sql('SELECT * FROM leads WHERE id = ? AND site_id = ?'), (lead_id, site['id'])).fetchone()
+    if not lead_row:
+        return jsonify({'error': 'Lead not found.'}), 404
+
+    result = send_manual_lead_email(row_to_dict(site), row_to_dict(lead_row), payload.get('subject') or '', payload.get('body_text') or '', payload.get('status_after_send') or 'open')
+    if not result.get('ok'):
+        return jsonify({'error': result.get('mail_result', {}).get('error') or result.get('error') or 'Manual email failed.', 'item': result.get('item') or {}}), 400
+
+    return jsonify({'success': True, 'item': result.get('item') or {}, 'mail_result': result.get('mail_result') or {}})
 
 
 @app.route('/api/v1/leads/<int:lead_id>/update', methods=['POST'])
