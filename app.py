@@ -110,6 +110,9 @@ WHITE_LABEL_DEFAULTS = {
     'smtp_password': '',
     'smtp_use_ssl': 0,
     'smtp_use_tls': 1,
+    'last_reply_sync_at': '',
+    'last_reply_sync_count': 0,
+    'last_reply_sync_error': '',
 }
 
 EMAIL_TEMPLATE_DEFAULTS = {
@@ -361,6 +364,9 @@ def init_db():
         'smtp_password': "smtp_password TEXT",
         'smtp_use_ssl': "smtp_use_ssl INTEGER DEFAULT 0",
         'smtp_use_tls': "smtp_use_tls INTEGER DEFAULT 1",
+        'last_reply_sync_at': "last_reply_sync_at TEXT",
+        'last_reply_sync_count': "last_reply_sync_count INTEGER DEFAULT 0",
+        'last_reply_sync_error': "last_reply_sync_error TEXT DEFAULT ''",
         'use_global_email_templates': "use_global_email_templates INTEGER DEFAULT 1",
         'ack_subject_template': "ack_subject_template TEXT",
         'ack_body_template': "ack_body_template TEXT",
@@ -806,6 +812,7 @@ def public_white_label_settings(site):
     settings = get_white_label_settings(site)
     settings['smtp_password'] = ''
     settings['smtp_password_saved'] = bool(settings.get('smtp_password_saved'))
+    settings['imap_configured'] = imap_is_configured()
     return settings
 
 
@@ -982,10 +989,38 @@ def notify_client_of_inbound_reply(site_data, lead, payload):
     return send_email_message(notify_site, client_email, subject, '\n'.join(body))
 
 
+def save_reply_sync_status(site_id, checked_at, replies_ingested=0, error=''):
+    if not site_id:
+        return
+    conn = db()
+    conn.execute(
+        sql('UPDATE sites SET last_reply_sync_at = ?, last_reply_sync_count = ?, last_reply_sync_error = ?, updated_at = ? WHERE id = ?'),
+        (checked_at, int(replies_ingested or 0), (error or '').strip(), checked_at, site_id)
+    )
+    conn.commit()
+
+
 def poll_inbound_replies_for_site(site):
     site_data = row_to_dict(site) or {}
-    if not imap_is_configured() or not site_data.get('id'):
-        return 0
+    checked_at = now_iso()
+    result = {
+        'success': True,
+        'imap_configured': imap_is_configured(),
+        'replies_ingested': 0,
+        'last_checked_at': checked_at,
+        'message': 'Reply sync completed.',
+        'error': '',
+    }
+    if not site_data.get('id'):
+        result['success'] = False
+        result['message'] = 'Missing site for reply sync.'
+        result['error'] = 'Missing site for reply sync.'
+        return result
+    if not result['imap_configured']:
+        result['message'] = 'IMAP is not configured for inbound reply capture.'
+        result['error'] = 'IMAP is not configured for inbound reply capture.'
+        save_reply_sync_status(site_data['id'], checked_at, 0, result['error'])
+        return result
 
     host = (os.getenv('IMAP_HOST') or '').strip()
     port = int((os.getenv('IMAP_PORT') or '993').strip())
@@ -1094,7 +1129,12 @@ def poll_inbound_replies_for_site(site):
                 conn.close()
 
         mailbox.logout()
+        result['replies_ingested'] = processed
+        result['message'] = 'Reply sync completed.' if processed == 0 else f'Reply sync completed. {processed} new repl' + ('y was' if processed == 1 else 'ies were') + ' captured.'
+        save_reply_sync_status(site_data['id'], checked_at, processed, '')
     except Exception as exc:
+        result['message'] = 'Reply sync failed.'
+        result['error'] = str(exc)
         log_mail_event('INBOUND_REPLY_POLL_ERROR', {
             'site_id': site_data.get('id'),
             'error': str(exc),
@@ -1102,8 +1142,9 @@ def poll_inbound_replies_for_site(site):
             'port': port,
             'folder': folder,
         })
+        save_reply_sync_status(site_data['id'], checked_at, 0, str(exc))
 
-    return processed
+    return result
 
 
 def parse_iso_ts(value):
@@ -2468,6 +2509,32 @@ def update_lead_api(lead_id):
     return jsonify({'success': True, 'item': row_to_dict(updated)})
 
 
+@app.route('/api/v1/replies/check', methods=['POST'])
+def check_replies_api():
+    payload = request.get_json(silent=True) or {}
+    site_token = (payload.get('site_token') or '').strip()
+    site_secret = (payload.get('site_secret') or '').strip()
+
+    site = get_site_by_token(site_token)
+    if not site:
+        return jsonify({'error': 'Invalid site token.'}), 404
+    if not site_secret or site_secret != site['site_secret']:
+        return jsonify({'error': 'Invalid site secret.'}), 403
+
+    sync_result = poll_inbound_replies_for_site(row_to_dict(site))
+    refreshed = db().execute(sql('SELECT * FROM sites WHERE id = ?'), (site['id'],)).fetchone()
+    public = public_white_label_settings(refreshed)
+    return jsonify({
+        'success': bool(sync_result.get('success')),
+        'imap_configured': bool(sync_result.get('imap_configured')),
+        'replies_ingested': int(sync_result.get('replies_ingested') or 0),
+        'last_checked_at': sync_result.get('last_checked_at') or now_iso(),
+        'message': sync_result.get('message') or 'Reply sync completed.',
+        'error': sync_result.get('error') or '',
+        'item': public,
+    })
+
+
 @app.route('/api/v1/automation/run', methods=['POST'])
 def run_automation_api():
     payload = request.get_json(silent=True) or {}
@@ -2540,13 +2607,15 @@ def run_automation_api():
             no_response_marked += 1
 
     conn.commit()
-    replies_ingested = poll_inbound_replies_for_site(site_data)
+    reply_sync = poll_inbound_replies_for_site(site_data)
     return jsonify({
         'success': True,
         'processed': processed,
         'follow_ups_sent': follow_ups_sent,
         'no_response_marked': no_response_marked,
-        'replies_ingested': replies_ingested,
+        'replies_ingested': int(reply_sync.get('replies_ingested') or 0),
+        'imap_configured': bool(reply_sync.get('imap_configured')),
+        'last_checked_at': reply_sync.get('last_checked_at') or now_iso(),
         'message': 'Website follow-up engine run completed.'
     })
 
