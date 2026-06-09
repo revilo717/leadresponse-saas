@@ -1157,6 +1157,68 @@ def parse_email_datetime(value):
         return parse_iso_ts(value)
 
 
+def iso_from_dt(dt, fallback=''):
+    if dt is None:
+        return fallback
+    try:
+        return dt.astimezone(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+    except Exception:
+        return fallback
+
+
+def inbound_event_created_at(sent_at):
+    dt = parse_email_datetime(sent_at)
+    return iso_from_dt(dt, now_iso())
+
+
+def event_payload_dict(event):
+    if not isinstance(event, dict):
+        return {}
+    payload = event.get('payload')
+    if isinstance(payload, dict):
+        return payload
+    payload_json = event.get('payload_json')
+    if not payload_json:
+        return {}
+    try:
+        return json.loads(payload_json)
+    except Exception:
+        return {}
+
+
+def event_occurred_dt(event):
+    if not isinstance(event, dict):
+        return parse_iso_ts('1970-01-01T00:00:00Z')
+    payload = event_payload_dict(event)
+    dt = None
+    if (event.get('event_type') or '') == 'customer_reply_received':
+        dt = parse_email_datetime(payload.get('sent_at') or payload.get('reply_occurred_at') or '')
+    if dt is None:
+        dt = parse_iso_ts(event.get('created_at'))
+    return dt or parse_iso_ts('1970-01-01T00:00:00Z')
+
+
+def event_occurred_at_iso(event):
+    return iso_from_dt(event_occurred_dt(event), (event or {}).get('created_at') or '')
+
+
+def sort_events_newest_first(events):
+    return sorted(
+        [event for event in (events or []) if isinstance(event, dict)],
+        key=lambda event: (event_occurred_dt(event), int(event.get('id') or 0)),
+        reverse=True,
+    )
+
+
+def latest_lead_event(lead_id):
+    rows = db().execute(
+        sql('SELECT * FROM lead_events WHERE lead_id = ? ORDER BY id DESC LIMIT 200'),
+        (lead_id,)
+    ).fetchall()
+    events = sort_events_newest_first([row_to_dict(row) for row in rows])
+    return events[0] if events else {}
+
+
 def outbound_message_ids_from_payload(payload):
     payload = payload or {}
     values = []
@@ -1302,7 +1364,7 @@ def poll_inbound_replies_for_site(site):
                 mailbox.starttls(ssl_context=ssl.create_default_context())
         mailbox.login(username, password)
         mailbox.select(folder)
-        message_nums = list(reversed(fetch_recent_imap_message_numbers(mailbox, lookback_days)))
+        message_nums = fetch_recent_imap_message_numbers(mailbox, lookback_days)
 
         for num in message_nums:
             typ, fetched = mailbox.fetch(num, '(BODY.PEEK[])')
@@ -1370,6 +1432,7 @@ def poll_inbound_replies_for_site(site):
                     continue
 
                 lead = row_to_dict(lead_row)
+                reply_event_at = inbound_event_created_at(sent_at)
                 payload = {
                     'from_name': from_name,
                     'from_email': sender_email,
@@ -1381,13 +1444,14 @@ def poll_inbound_replies_for_site(site):
                     'message_id': message_id,
                     'reply_fingerprint': reply_fingerprint,
                     'sent_at': sent_at,
+                    'reply_occurred_at': reply_event_at,
                     'reply_via': 'imap',
                     'imap_folder': folder,
                     'in_reply_to': in_reply_to,
                     'references': references,
                     'matched_via': matched_via,
                 }
-                create_lead_event(conn, site_data['id'], lead['id'], 'customer_reply_received', payload, now_iso())
+                create_lead_event(conn, site_data['id'], lead['id'], 'customer_reply_received', payload, reply_event_at)
                 existing_notes = (lead.get('notes') or '').strip()
                 snippet = (body_text_preview or body_text_clean or body_text or '').strip()
                 if len(snippet) > 700:
@@ -1473,11 +1537,12 @@ def create_lead_event(conn, site_id, lead_id, event_type, payload, created_at=No
 
 
 def latest_event_for_lead(lead_id, event_type):
-    row = db().execute(
-        sql('SELECT * FROM lead_events WHERE lead_id = ? AND event_type = ? ORDER BY id DESC LIMIT 1'),
+    rows = db().execute(
+        sql('SELECT * FROM lead_events WHERE lead_id = ? AND event_type = ? ORDER BY id DESC LIMIT 200'),
         (lead_id, event_type)
-    ).fetchone()
-    return row_to_dict(row)
+    ).fetchall()
+    events = sort_events_newest_first([row_to_dict(row) for row in rows])
+    return events[0] if events else {}
 
 
 def update_lead_status(conn, lead_id, status=None, notes=None):
@@ -2661,36 +2726,35 @@ def enrich_lead_for_inbox(lead):
     except Exception:
         reply_count = 0
 
-    latest_event = db().execute(
-        sql('SELECT * FROM lead_events WHERE lead_id = ? ORDER BY id DESC LIMIT 1'),
-        (lead_id,)
-    ).fetchone()
-    latest_event_dict = row_to_dict(latest_event)
+    latest_event_dict = latest_lead_event(lead_id) or {}
     latest_reply_payload = parse_payload(latest_reply.get('payload_json')) if latest_reply else {}
     latest_reply_preview = summarize_timeline_payload(latest_reply_payload)
     if len(latest_reply_preview) > 220:
         latest_reply_preview = latest_reply_preview[:220] + '…'
 
+    latest_reply_at = event_occurred_at_iso(latest_reply) if latest_reply else ''
+    latest_event_at = event_occurred_at_iso(latest_event_dict) if latest_event_dict else (lead.get('created_at') or '')
+
     lead['reply_count'] = reply_count
-    lead['latest_reply_at'] = latest_reply.get('created_at') or ''
+    lead['latest_reply_at'] = latest_reply_at
     lead['latest_reply_preview'] = latest_reply_preview
     lead['latest_event_type'] = latest_event_dict.get('event_type') or ''
-    lead['latest_event_at'] = latest_event_dict.get('created_at') or lead.get('created_at') or ''
-    lead['latest_activity_at'] = latest_reply.get('created_at') or latest_event_dict.get('created_at') or lead.get('created_at') or ''
+    lead['latest_event_at'] = latest_event_at
+    lead['latest_activity_at'] = latest_reply_at or latest_event_at or lead.get('created_at') or ''
     return lead
 
 
 def lead_timeline_for_api(lead_id, limit=50):
     rows = db().execute(
         sql('SELECT * FROM lead_events WHERE lead_id = ? ORDER BY id DESC LIMIT ?'),
-        (lead_id, int(limit))
+        (lead_id, int(limit) * 4)
     ).fetchall()
     events = []
     for row in rows:
         event = row_to_dict(row)
         event['payload'] = parse_payload(event.get('payload_json'))
         events.append(event)
-    return events
+    return sort_events_newest_first(events)[:int(limit)]
 
 
 @app.route('/api/v1/leads', methods=['GET'])
