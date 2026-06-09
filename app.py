@@ -938,6 +938,91 @@ def extract_email_address(value):
     return (parseaddr(value or '')[1] or '').strip().lower()
 
 
+def strip_html_to_text(value):
+    text = re.sub(r'(?is)<(script|style)[^>]*>.*?</\1>', ' ', value or '')
+    text = re.sub(r'(?i)<br\\s*/?>', '\\n', text)
+    text = re.sub(r'(?i)</p\\s*>', '\\n\\n', text)
+    text = re.sub(r'(?i)</div\\s*>', '\\n', text)
+    text = re.sub(r'(?is)<blockquote[^>]*>.*?</blockquote>', ' ', text)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = text.replace('&nbsp;', ' ')
+    return text
+
+
+def normalize_email_text(value):
+    text = (value or '').replace('\r\n', '\n').replace('\r', '\n')
+    text = text.replace('\u00a0', ' ')
+    text = re.sub(r'[ \t]+\n', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def trim_reply_disclaimer_and_history(value):
+    text = normalize_email_text(value)
+    if not text:
+        return ''
+    lines = text.split('\n')
+    kept = []
+    meaningful_seen = 0
+    quote_markers = [
+        r'^on .+ wrote:$',
+        r'^from:\s',
+        r'^sent:\s',
+        r'^subject:\s',
+        r'^to:\s',
+        r'^cc:\s',
+        r'^-----original message-----$',
+        r'^_{5,}$',
+        r'^-{5,}$',
+    ]
+    disclaimer_markers = [
+        'this electronic mail transmission is intended',
+        'this email and any files transmitted',
+        'this message and any attachments',
+        'may contain private and confidential information',
+        'please return the original to us immediately',
+        'no liability for any loss or damage',
+        'virus checking',
+    ]
+    signature_markers = [
+        r'^(regards|kind regards|best regards|many thanks|thanks|cheers|sincerely)[,!\.]?$',
+    ]
+    for line in lines:
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if meaningful_seen > 0 and any(re.match(pattern, lowered, flags=re.IGNORECASE) for pattern in quote_markers):
+            break
+        if meaningful_seen > 0 and any(marker in lowered for marker in disclaimer_markers):
+            break
+        if meaningful_seen > 0 and any(re.match(pattern, stripped, flags=re.IGNORECASE) for pattern in signature_markers):
+            break
+        kept.append(line.rstrip())
+        if stripped:
+            meaningful_seen += 1
+    return normalize_email_text('\n'.join(kept))
+
+
+def clean_inbound_reply_text(value):
+    cleaned = trim_reply_disclaimer_and_history(value)
+    if not cleaned:
+        return ''
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', cleaned) if p.strip()]
+    if not paragraphs:
+        return ''
+    return re.sub(r'\s+', ' ', paragraphs[0]).strip()
+
+
+def reply_preview_text(value, limit=220):
+    text = clean_inbound_reply_text(value)
+    if not text:
+        text = normalize_email_text(value)
+        if text:
+            text = re.sub(r'\s+', ' ', text).strip()
+    if len(text) > limit:
+        text = text[:limit] + '…'
+    return text
+
+
 def extract_message_text(message):
     text_chunks = []
     html_chunks = []
@@ -963,9 +1048,9 @@ def extract_message_text(message):
         if content_type == 'text/plain':
             text_chunks.append(decoded)
         else:
-            html_chunks.append(re.sub(r'<[^>]+>', ' ', decoded))
+            html_chunks.append(strip_html_to_text(decoded))
     joined = '\n\n'.join(text_chunks or html_chunks)
-    return re.sub(r'\n{3,}', '\n\n', joined).strip()
+    return normalize_email_text(joined)
 
 
 def imap_is_configured():
@@ -987,7 +1072,7 @@ def notify_client_of_inbound_reply(site_data, lead, payload):
         f"Email: {payload.get('from_email') or 'Unknown email'}",
         f"Subject: {payload.get('subject') or 'No subject'}",
         '',
-        payload.get('body_text') or 'No message body extracted.',
+        payload.get('body_text_clean') or payload.get('body_text') or 'No message body extracted.',
         '',
         'This reply has also been saved to the lead timeline in LeadResponse.',
     ]
@@ -1238,12 +1323,15 @@ def poll_inbound_replies_for_site(site):
 
             message_id = decode_email_header_value(message.get('Message-ID') or '').strip()
             subject = decode_email_header_value(message.get('Subject') or '').strip()
-            body_text = extract_message_text(message)
+            body_text_raw = extract_message_text(message)
+            body_text_clean = clean_inbound_reply_text(body_text_raw)
+            body_text_preview = reply_preview_text(body_text_clean or body_text_raw)
+            body_text = body_text_clean or body_text_preview or body_text_raw
             sent_at = decode_email_header_value(message.get('Date') or '').strip()
             from_name = decode_email_header_value(parseaddr(message.get('From') or '')[0])
             in_reply_to = decode_email_header_value(message.get('In-Reply-To') or '').strip()
             references = decode_email_header_value(message.get('References') or '').strip()
-            reply_fingerprint = inbound_reply_fingerprint(sender_email, subject, body_text, sent_at)
+            reply_fingerprint = inbound_reply_fingerprint(sender_email, subject, body_text_raw, sent_at)
 
             conn = connect_db()
             try:
@@ -1287,6 +1375,9 @@ def poll_inbound_replies_for_site(site):
                     'from_email': sender_email,
                     'subject': subject,
                     'body_text': body_text,
+                    'body_text_clean': body_text_clean,
+                    'body_text_raw': body_text_raw,
+                    'reply_preview_clean': body_text_preview,
                     'message_id': message_id,
                     'reply_fingerprint': reply_fingerprint,
                     'sent_at': sent_at,
@@ -1298,7 +1389,7 @@ def poll_inbound_replies_for_site(site):
                 }
                 create_lead_event(conn, site_data['id'], lead['id'], 'customer_reply_received', payload, now_iso())
                 existing_notes = (lead.get('notes') or '').strip()
-                snippet = (body_text or '').strip()
+                snippet = (body_text_preview or body_text_clean or body_text or '').strip()
                 if len(snippet) > 700:
                     snippet = snippet[:700] + '…'
                 note_entry = f"[{now_iso()}] Customer reply from {sender_email}: {snippet or 'No body extracted.'}"
@@ -2536,7 +2627,7 @@ def summarize_timeline_payload(payload):
     payload = payload or {}
     if not isinstance(payload, dict):
         return str(payload)
-    for key in ('body_text', 'message', 'subject', 'notes', 'error'):
+    for key in ('reply_preview_clean', 'body_text_clean', 'body_text', 'message', 'subject', 'notes', 'error'):
         value = (payload.get(key) or '').strip() if isinstance(payload.get(key), str) else payload.get(key)
         if isinstance(value, str) and value:
             return value
