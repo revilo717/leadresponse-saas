@@ -103,6 +103,13 @@ WHITE_LABEL_DEFAULTS = {
     'delivery_mode': 'platform_domain',
     'sender_name': '',
     'sender_email': '',
+    'transport_mode': 'platform_smtp',
+    'smtp_host': '',
+    'smtp_port': '587',
+    'smtp_username': '',
+    'smtp_password': '',
+    'smtp_use_ssl': 0,
+    'smtp_use_tls': 1,
 }
 
 WHITE_LABEL_STATUS_VALUES = {'not_started', 'pending', 'verified', 'failed'}
@@ -335,6 +342,13 @@ def init_db():
         'delivery_mode': "delivery_mode TEXT DEFAULT 'platform_domain'",
         'sender_name': "sender_name TEXT",
         'sender_email': "sender_email TEXT",
+        'transport_mode': "transport_mode TEXT DEFAULT 'platform_smtp'",
+        'smtp_host': "smtp_host TEXT",
+        'smtp_port': "smtp_port INTEGER DEFAULT 587",
+        'smtp_username': "smtp_username TEXT",
+        'smtp_password': "smtp_password TEXT",
+        'smtp_use_ssl': "smtp_use_ssl INTEGER DEFAULT 0",
+        'smtp_use_tls': "smtp_use_tls INTEGER DEFAULT 1",
     }
     for column_name, column_sql in site_columns.items():
         ensure_column(conn, 'sites', column_name, column_sql)
@@ -675,6 +689,17 @@ def get_white_label_settings(site):
     requested_mode = (site_data.get('delivery_mode') or settings.get('delivery_mode') or 'platform_domain').strip() or 'platform_domain'
     settings['sender_name'] = (site_data.get('sender_name') or '').strip()
     settings['sender_email'] = clean_email_value(site_data.get('sender_email') or '')
+    requested_transport = (site_data.get('transport_mode') or settings.get('transport_mode') or 'platform_smtp').strip() or 'platform_smtp'
+    if requested_transport not in ('site_smtp', 'platform_smtp'):
+        requested_transport = 'platform_smtp'
+    settings['requested_transport_mode'] = requested_transport
+    settings['smtp_host'] = (site_data.get('smtp_host') or '').strip()
+    settings['smtp_port'] = str(site_data.get('smtp_port') or '587').strip() or '587'
+    settings['smtp_username'] = (site_data.get('smtp_username') or '').strip()
+    settings['smtp_password'] = site_data.get('smtp_password') or ''
+    settings['smtp_password_saved'] = bool(site_data.get('smtp_password'))
+    settings['smtp_use_ssl'] = 1 if coerce_bool(site_data.get('smtp_use_ssl'), False) else 0
+    settings['smtp_use_tls'] = 1 if coerce_bool(site_data.get('smtp_use_tls'), True) else 0
     settings['dns_last_checked_at'] = (site_data.get('dns_last_checked_at') or '').strip()
     settings['portal_domain'] = f"{settings['portal_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
     settings['email_domain'] = f"{settings['email_subdomain']}.{settings['site_domain']}" if settings['site_domain'] else ''
@@ -697,6 +722,16 @@ def get_white_label_settings(site):
         settings['active_from_email'] = settings['platform_from_email']
         settings['active_from_name'] = settings['platform_from_name']
     settings['mail_from_name'] = settings['active_from_name']
+    site_smtp_ready = bool(settings['smtp_host'] and settings['smtp_username'] and settings['smtp_password'])
+    if settings['requested_transport_mode'] == 'site_smtp' and site_smtp_ready:
+        settings['transport_mode'] = 'site_smtp'
+        settings['transport_summary'] = 'Using client SMTP credentials for outbound email.'
+    elif settings['requested_transport_mode'] == 'site_smtp':
+        settings['transport_mode'] = 'platform_smtp'
+        settings['transport_summary'] = 'Client SMTP selected but incomplete. Falling back to LeadResponse platform SMTP until host, username, and password are saved.'
+    else:
+        settings['transport_mode'] = 'platform_smtp'
+        settings['transport_summary'] = 'Using LeadResponse platform SMTP fallback.'
     settings['portal_dns_record'] = {
         'host': settings['portal_subdomain'],
         'type': 'CNAME',
@@ -728,7 +763,23 @@ def resolve_mail_profile(site):
         'delivery_mode': white_label.get('delivery_mode') or 'platform_domain',
         'branded_sender_email': white_label.get('branded_sender_email') or '',
         'platform_from_email': white_label.get('platform_from_email') or '',
+        'transport_mode': white_label.get('transport_mode') or 'platform_smtp',
+        'requested_transport_mode': white_label.get('requested_transport_mode') or 'platform_smtp',
+        'transport_summary': white_label.get('transport_summary') or '',
+        'smtp_host': white_label.get('smtp_host') or '',
+        'smtp_port': white_label.get('smtp_port') or '587',
+        'smtp_username': white_label.get('smtp_username') or '',
+        'smtp_password': white_label.get('smtp_password') or '',
+        'smtp_use_ssl': 1 if coerce_bool(white_label.get('smtp_use_ssl'), False) else 0,
+        'smtp_use_tls': 1 if coerce_bool(white_label.get('smtp_use_tls'), True) else 0,
     }
+
+
+def public_white_label_settings(site):
+    settings = get_white_label_settings(site)
+    settings['smtp_password'] = ''
+    settings['smtp_password_saved'] = bool(settings.get('smtp_password_saved'))
+    return settings
 
 
 def fmt_dt(value):
@@ -1031,11 +1082,21 @@ def send_email_message(site, to_email, subject, body_text):
     if not to_email:
         return {'ok': False, 'mode': 'skipped', 'error': 'Missing recipient email.'}
 
-    host = (os.getenv('SMTP_HOST') or '').strip()
-    port = int((os.getenv('SMTP_PORT') or '587').strip())
-    username = (os.getenv('SMTP_USERNAME') or '').strip()
-    password = os.getenv('SMTP_PASSWORD') or ''
     profile = resolve_mail_profile(site)
+    if profile.get('transport_mode') == 'site_smtp':
+        host = (profile.get('smtp_host') or '').strip()
+        port = int((str(profile.get('smtp_port') or '587')).strip())
+        username = (profile.get('smtp_username') or '').strip()
+        password = profile.get('smtp_password') or ''
+        use_ssl = bool(profile.get('smtp_use_ssl'))
+        use_tls = bool(profile.get('smtp_use_tls')) if not use_ssl else False
+    else:
+        host = (os.getenv('SMTP_HOST') or '').strip()
+        port = int((os.getenv('SMTP_PORT') or '587').strip())
+        username = (os.getenv('SMTP_USERNAME') or '').strip()
+        password = os.getenv('SMTP_PASSWORD') or ''
+        use_ssl = env_flag('SMTP_USE_SSL', False)
+        use_tls = env_flag('SMTP_USE_TLS', not use_ssl)
     from_email = (profile.get('from_email') or os.getenv('MAIL_FROM') or username or 'no-reply@leadresponse.local').strip()
     from_name = (profile.get('from_name') or os.getenv('MAIL_FROM_NAME') or 'LeadResponse').strip()
     reply_to_email = (profile.get('reply_to_email') or '').strip()
@@ -1050,6 +1111,7 @@ def send_email_message(site, to_email, subject, body_text):
             'from_email': from_email,
             'from_name': from_name,
             'reply_to_email': reply_to_email,
+            'transport_mode': profile.get('transport_mode') or 'platform_smtp',
         }
         log_mail_event('SMTP_SIMULATION', result)
         return result
@@ -1061,9 +1123,6 @@ def send_email_message(site, to_email, subject, body_text):
     if reply_to_email:
         msg['Reply-To'] = reply_to_email
     msg.set_content(body_text)
-
-    use_ssl = env_flag('SMTP_USE_SSL', False)
-    use_tls = env_flag('SMTP_USE_TLS', not use_ssl)
 
     smtp_timeout = int((os.getenv('SMTP_TIMEOUT_SECONDS') or '10').strip())
 
@@ -1078,6 +1137,7 @@ def send_email_message(site, to_email, subject, body_text):
         'from_name': from_name,
         'reply_to_email': reply_to_email,
         'delivery_mode': profile.get('delivery_mode') or 'platform_domain',
+        'transport_mode': profile.get('transport_mode') or 'platform_smtp',
         'subject': subject,
     })
 
@@ -1101,6 +1161,7 @@ def send_email_message(site, to_email, subject, body_text):
             'from_email': from_email,
             'from_name': from_name,
             'reply_to_email': reply_to_email,
+            'transport_mode': profile.get('transport_mode') or 'platform_smtp',
         }
         log_mail_event('SMTP_SEND_SUCCESS', result)
         return result
@@ -1114,6 +1175,7 @@ def send_email_message(site, to_email, subject, body_text):
             'from_email': from_email,
             'from_name': from_name,
             'reply_to_email': reply_to_email,
+            'transport_mode': profile.get('transport_mode') or 'platform_smtp',
             'error': str(exc),
         }
         log_mail_event('SMTP_SEND_ERROR', result)
@@ -1974,7 +2036,7 @@ def white_label_config():
     site = get_site_by_token(site_token)
     if not site:
         return jsonify({'error': 'Site not found.'}), 404
-    return jsonify(get_white_label_settings(site))
+    return jsonify(public_white_label_settings(site))
 
 
 @app.route('/api/v1/sites/white-label-status', methods=['GET'])
@@ -1990,8 +2052,14 @@ def white_label_status():
         'email_domain_status': settings['email_domain_status'],
         'dns_last_checked_at': settings.get('dns_last_checked_at') or '',
         'delivery_mode': settings.get('delivery_mode') or 'platform_domain',
+        'transport_mode': settings.get('transport_mode') or 'platform_smtp',
+        'requested_transport_mode': settings.get('requested_transport_mode') or 'platform_smtp',
+        'transport_summary': settings.get('transport_summary') or '',
         'active_from_email': settings.get('active_from_email') or '',
-        'branded_sender_email': settings.get('branded_sender_email') or ''
+        'branded_sender_email': settings.get('branded_sender_email') or '',
+        'smtp_host': settings.get('smtp_host') or '',
+        'smtp_username': settings.get('smtp_username') or '',
+        'smtp_password_saved': bool(settings.get('smtp_password_saved')),
     })
 
 
@@ -2021,6 +2089,18 @@ def update_white_label_settings_api():
         delivery_mode = 'platform_domain'
     sender_name = (payload.get('sender_name') or existing.get('sender_name') or '').strip()
     sender_email = clean_email_value(payload.get('sender_email') or existing.get('sender_email') or '')
+    transport_mode = (payload.get('transport_mode') or existing.get('requested_transport_mode') or existing.get('transport_mode') or 'platform_smtp').strip() or 'platform_smtp'
+    if transport_mode not in ('site_smtp', 'platform_smtp'):
+        transport_mode = 'platform_smtp'
+    smtp_host = (payload.get('smtp_host') or existing.get('smtp_host') or '').strip()
+    smtp_port = int(payload.get('smtp_port') or existing.get('smtp_port') or 587)
+    smtp_username = (payload.get('smtp_username') or existing.get('smtp_username') or '').strip()
+    incoming_password = payload.get('smtp_password')
+    smtp_password = existing.get('smtp_password') or ''
+    if incoming_password is not None and str(incoming_password) != '':
+        smtp_password = str(incoming_password)
+    smtp_use_ssl = 1 if coerce_bool(payload.get('smtp_use_ssl'), existing.get('smtp_use_ssl', False)) else 0
+    smtp_use_tls = 1 if coerce_bool(payload.get('smtp_use_tls'), existing.get('smtp_use_tls', True)) else 0
     portal_domain_status = normalize_white_label_status(payload.get('portal_domain_status'), existing.get('portal_domain_status') or 'not_started')
     email_domain_status = normalize_white_label_status(payload.get('email_domain_status'), existing.get('email_domain_status') or 'not_started')
     dns_last_checked_at = (payload.get('dns_last_checked_at') or existing.get('dns_last_checked_at') or '').strip()
@@ -2028,8 +2108,8 @@ def update_white_label_settings_api():
 
     conn = db()
     conn.execute(
-        sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, email_provider = ?, email_from_localpart = ?, reply_to_email = ?, reply_handling_mode = ?, delivery_mode = ?, sender_name = ?, sender_email = ?, updated_at = ? WHERE id = ?'),
-        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, dns_last_checked_at, email_provider, email_from_localpart, reply_to_email, reply_handling_mode, delivery_mode, sender_name, sender_email, updated_at, site['id'])
+        sql('UPDATE sites SET white_label_enabled = ?, brand_display_name = ?, portal_subdomain = ?, portal_domain_status = ?, email_subdomain = ?, email_domain_status = ?, dns_last_checked_at = ?, email_provider = ?, email_from_localpart = ?, reply_to_email = ?, reply_handling_mode = ?, delivery_mode = ?, sender_name = ?, sender_email = ?, transport_mode = ?, smtp_host = ?, smtp_port = ?, smtp_username = ?, smtp_password = ?, smtp_use_ssl = ?, smtp_use_tls = ?, updated_at = ? WHERE id = ?'),
+        (white_label_enabled, brand_display_name, portal_subdomain, portal_domain_status, email_subdomain, email_domain_status, dns_last_checked_at, email_provider, email_from_localpart, reply_to_email, reply_handling_mode, delivery_mode, sender_name, sender_email, transport_mode, smtp_host, smtp_port, smtp_username, smtp_password, smtp_use_ssl, smtp_use_tls, updated_at, site['id'])
     )
     create_lead_event(conn, site['id'], None, 'white_label_settings_updated', {
         'white_label_enabled': bool(white_label_enabled),
@@ -2045,12 +2125,19 @@ def update_white_label_settings_api():
         'delivery_mode': delivery_mode,
         'sender_name': sender_name,
         'sender_email': sender_email,
+        'transport_mode': transport_mode,
+        'smtp_host': smtp_host,
+        'smtp_port': smtp_port,
+        'smtp_username': smtp_username,
+        'smtp_password_saved': bool(smtp_password),
+        'smtp_use_ssl': bool(smtp_use_ssl),
+        'smtp_use_tls': bool(smtp_use_tls),
         'dns_last_checked_at': dns_last_checked_at,
     }, updated_at)
     conn.commit()
 
     refreshed = db().execute(sql('SELECT * FROM sites WHERE id = ?'), (site['id'],)).fetchone()
-    return jsonify({'success': True, 'item': get_white_label_settings(refreshed)})
+    return jsonify({'success': True, 'item': public_white_label_settings(refreshed)})
 
 @app.route('/api/v1/lead-events', methods=['POST'])
 def lead_events():
