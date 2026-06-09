@@ -1203,9 +1203,10 @@ def send_ack_email_async(site_data, lead, site_id, lead_id):
         log_mail_event('AUTO_ACK_START', {'site_id': site_id, 'lead_id': lead_id, 'to': recipient})
         subject, body = build_ack_email(site_data, lead)
         mail_result = send_email_message(site_data, recipient, subject, body)
+        event_payload = {**mail_result, 'subject': subject, 'body_text': body}
         event_type = 'auto_ack_sent' if mail_result.get('ok') else 'auto_ack_failed'
-        log_mail_event('AUTO_ACK_RESULT', {'site_id': site_id, 'lead_id': lead_id, 'event_type': event_type, **mail_result})
-        persist_mail_event_async(site_id, lead_id, event_type, mail_result)
+        log_mail_event('AUTO_ACK_RESULT', {'site_id': site_id, 'lead_id': lead_id, 'event_type': event_type, **event_payload})
+        persist_mail_event_async(site_id, lead_id, event_type, event_payload)
 
         if site_data.get('booking_url') and mail_result.get('ok'):
             persist_mail_event_async(site_id, lead_id, 'booking_link_sent', {
@@ -2466,7 +2467,8 @@ def run_automation_api():
 
         subject, body = build_follow_up_email(site_data, lead, step_to_send)
         result = send_email_message(site_data, (lead.get('email') or '').strip(), subject, body)
-        create_lead_event(conn, site['id'], lead['id'], f'follow_up_{step_to_send}_sent', result, now_iso())
+        event_payload = {**result, 'subject': subject, 'body_text': body, 'step_number': step_to_send}
+        create_lead_event(conn, site['id'], lead['id'], f'follow_up_{step_to_send}_sent', event_payload, now_iso())
         follow_ups_sent += 1
 
         if step_to_send == 1 and site['booking_url']:
