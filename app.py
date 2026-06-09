@@ -14,7 +14,7 @@ import smtplib
 import ssl
 import threading
 from email.message import EmailMessage
-from email.utils import parseaddr
+from email.utils import parseaddr, make_msgid, parsedate_to_datetime
 from email.header import decode_header, make_header
 
 try:
@@ -32,6 +32,13 @@ app.config['JSON_SORT_KEYS'] = False
 
 ALLOWED_STATUSES = ['new', 'acknowledged', 'qualified', 'booking_sent', 'open', 'booked', 'won', 'lost', 'no_response']
 REPLY_HANDLING_VALUES = {'lead_inbox', 'client_email'}
+OUTBOUND_THREAD_EVENT_TYPES = (
+    'manual_email_sent',
+    'auto_ack_sent',
+    'follow_up_1_sent',
+    'follow_up_2_sent',
+    'follow_up_3_sent',
+)
 
 WIDGET_TEXT_DEFAULTS = {
     'widget_title': 'LeadResponse',
@@ -1025,6 +1032,139 @@ def fetch_recent_imap_message_numbers(mailbox, lookback_days=7):
     return []
 
 
+def normalize_message_id_token(value):
+    token = decode_email_header_value(value or '').strip().lower()
+    if not token:
+        return ''
+    if token.startswith('<') and token.endswith('>'):
+        token = token[1:-1].strip()
+    return token
+
+
+def extract_header_message_ids(value):
+    raw = decode_email_header_value(value or '')
+    if not raw:
+        return []
+    matches = re.findall(r'<[^>]+>', raw)
+    if matches:
+        tokens = [normalize_message_id_token(match) for match in matches]
+    else:
+        tokens = [normalize_message_id_token(part) for part in re.split(r'[\s,]+', raw) if '@' in part]
+    return [token for token in tokens if token]
+
+
+def normalize_thread_subject(value):
+    text = re.sub(r'^(re|fw|fwd)\s*:\s*', '', (value or '').strip(), flags=re.IGNORECASE)
+    return re.sub(r'\s+', ' ', text).strip().lower()
+
+
+def parse_email_datetime(value):
+    if not value:
+        return None
+    try:
+        dt = parsedate_to_datetime(str(value))
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return parse_iso_ts(value)
+
+
+def outbound_message_ids_from_payload(payload):
+    payload = payload or {}
+    values = []
+    for key in ('message_id', 'outbound_message_id'):
+        token = normalize_message_id_token(payload.get(key) or '')
+        if token:
+            values.append(token)
+    return values
+
+
+def recent_outbound_thread_events(conn, site_id, recipient_email, limit=800):
+    rows = conn.execute(
+        sql('SELECT * FROM lead_events WHERE site_id = ? ORDER BY id DESC LIMIT ?'),
+        (site_id, int(limit))
+    ).fetchall()
+    events = []
+    recipient_email = (recipient_email or '').strip().lower()
+    for row in rows:
+        event = row_to_dict(row)
+        if event.get('event_type') not in OUTBOUND_THREAD_EVENT_TYPES:
+            continue
+        payload = parse_payload(event.get('payload_json'))
+        if recipient_email and (payload.get('to') or '').strip().lower() != recipient_email:
+            continue
+        event['payload'] = payload
+        events.append(event)
+    return events
+
+
+def find_lead_by_thread_headers(conn, site_id, sender_email, in_reply_to, references):
+    reference_ids = set(extract_header_message_ids(in_reply_to) + extract_header_message_ids(references))
+    if not reference_ids:
+        return None, ''
+    for event in recent_outbound_thread_events(conn, site_id, sender_email):
+        outbound_ids = set(outbound_message_ids_from_payload(event.get('payload')))
+        if outbound_ids and reference_ids.intersection(outbound_ids):
+            lead_row = conn.execute(
+                sql('SELECT * FROM leads WHERE id = ? AND site_id = ? LIMIT 1'),
+                (event.get('lead_id'), site_id)
+            ).fetchone()
+            if lead_row:
+                return lead_row, 'thread_headers'
+    return None, ''
+
+
+def find_lead_by_safe_fallback(conn, site_id, sender_email, subject, sent_at):
+    outbound_events = recent_outbound_thread_events(conn, site_id, sender_email)
+    unique_lead_ids = []
+    for event in outbound_events:
+        lead_id = int(event.get('lead_id') or 0)
+        if lead_id and lead_id not in unique_lead_ids:
+            unique_lead_ids.append(lead_id)
+    if len(unique_lead_ids) != 1:
+        return None, 'ambiguous_sender_email'
+
+    lead_id = unique_lead_ids[0]
+    lead_row = conn.execute(
+        sql('SELECT * FROM leads WHERE id = ? AND site_id = ? LIMIT 1'),
+        (lead_id, site_id)
+    ).fetchone()
+    if not lead_row:
+        return None, 'lead_not_found'
+
+    latest_outbound = None
+    for event in outbound_events:
+        if int(event.get('lead_id') or 0) == lead_id:
+            latest_outbound = event
+            break
+    if not latest_outbound:
+        return None, 'no_outbound_context'
+
+    outbound_dt = parse_iso_ts(latest_outbound.get('created_at'))
+    inbound_dt = parse_email_datetime(sent_at)
+    if outbound_dt and datetime.now(timezone.utc) - outbound_dt > timedelta(days=30):
+        return None, 'outbound_context_too_old'
+    if inbound_dt and outbound_dt and inbound_dt + timedelta(minutes=2) < outbound_dt:
+        return None, 'reply_older_than_latest_outbound'
+
+    inbound_subject = normalize_thread_subject(subject)
+    outbound_subject = normalize_thread_subject((latest_outbound.get('payload') or {}).get('subject') or '')
+    if inbound_subject and outbound_subject and inbound_subject != outbound_subject:
+        return None, 'subject_mismatch_without_thread_headers'
+
+    return lead_row, 'single_recent_outbound_fallback'
+
+
+def resolve_inbound_reply_lead(conn, site_id, sender_email, subject, in_reply_to, references, sent_at):
+    lead_row, matched_via = find_lead_by_thread_headers(conn, site_id, sender_email, in_reply_to, references)
+    if lead_row:
+        return lead_row, matched_via
+    return find_lead_by_safe_fallback(conn, site_id, sender_email, subject, sent_at)
+
+
 def save_reply_sync_status(site_id, checked_at, replies_ingested=0, error=''):
     if not site_id:
         return
@@ -1077,7 +1217,7 @@ def poll_inbound_replies_for_site(site):
                 mailbox.starttls(ssl_context=ssl.create_default_context())
         mailbox.login(username, password)
         mailbox.select(folder)
-        message_nums = fetch_recent_imap_message_numbers(mailbox, lookback_days)
+        message_nums = list(reversed(fetch_recent_imap_message_numbers(mailbox, lookback_days)))
 
         for num in message_nums:
             typ, fetched = mailbox.fetch(num, '(BODY.PEEK[])')
@@ -1101,6 +1241,8 @@ def poll_inbound_replies_for_site(site):
             body_text = extract_message_text(message)
             sent_at = decode_email_header_value(message.get('Date') or '').strip()
             from_name = decode_email_header_value(parseaddr(message.get('From') or '')[0])
+            in_reply_to = decode_email_header_value(message.get('In-Reply-To') or '').strip()
+            references = decode_email_header_value(message.get('References') or '').strip()
             reply_fingerprint = inbound_reply_fingerprint(sender_email, subject, body_text, sent_at)
 
             conn = connect_db()
@@ -1119,16 +1261,23 @@ def poll_inbound_replies_for_site(site):
                 if duplicate:
                     continue
 
-                lead_row = conn.execute(
-                    sql('SELECT * FROM leads WHERE site_id = ? AND lower(email) = ? ORDER BY id DESC LIMIT 1'),
-                    (site_data['id'], sender_email)
-                ).fetchone()
+                lead_row, matched_via = resolve_inbound_reply_lead(
+                    conn,
+                    site_data['id'],
+                    sender_email,
+                    subject,
+                    in_reply_to,
+                    references,
+                    sent_at,
+                )
                 if not lead_row:
                     log_mail_event('INBOUND_REPLY_UNMATCHED', {
                         'site_id': site_data['id'],
                         'from_email': sender_email,
                         'subject': subject,
                         'folder': folder,
+                        'in_reply_to': in_reply_to,
+                        'references': references,
                     })
                     continue
 
@@ -1143,6 +1292,9 @@ def poll_inbound_replies_for_site(site):
                     'sent_at': sent_at,
                     'reply_via': 'imap',
                     'imap_folder': folder,
+                    'in_reply_to': in_reply_to,
+                    'references': references,
+                    'matched_via': matched_via,
                 }
                 create_lead_event(conn, site_data['id'], lead['id'], 'customer_reply_received', payload, now_iso())
                 existing_notes = (lead.get('notes') or '').strip()
@@ -1160,6 +1312,7 @@ def poll_inbound_replies_for_site(site):
                     'from_email': sender_email,
                     'subject': subject,
                     'folder': folder,
+                    'matched_via': matched_via,
                 })
                 notification = notify_client_of_inbound_reply(site_data, lead, payload)
                 if notification:
@@ -1268,6 +1421,7 @@ def send_email_message(site, to_email, subject, body_text):
     from_email = (profile.get('from_email') or os.getenv('MAIL_FROM') or username or 'no-reply@leadresponse.local').strip()
     from_name = (profile.get('from_name') or os.getenv('MAIL_FROM_NAME') or 'LeadResponse').strip()
     reply_to_email = (profile.get('reply_to_email') or '').strip()
+    message_id = make_msgid()
 
     if not host:
         result = {
@@ -1280,6 +1434,7 @@ def send_email_message(site, to_email, subject, body_text):
             'from_name': from_name,
             'reply_to_email': reply_to_email,
             'transport_mode': profile.get('transport_mode') or 'platform_smtp',
+            'message_id': message_id,
         }
         log_mail_event('SMTP_SIMULATION', result)
         return result
@@ -1288,6 +1443,7 @@ def send_email_message(site, to_email, subject, body_text):
     msg['Subject'] = subject
     msg['From'] = f'{from_name} <{from_email}>' if from_name else from_email
     msg['To'] = to_email
+    msg['Message-ID'] = message_id
     if reply_to_email:
         msg['Reply-To'] = reply_to_email
     msg.set_content(body_text)
@@ -1307,6 +1463,7 @@ def send_email_message(site, to_email, subject, body_text):
         'delivery_mode': profile.get('delivery_mode') or 'platform_domain',
         'transport_mode': profile.get('transport_mode') or 'platform_smtp',
         'subject': subject,
+        'message_id': message_id,
     })
 
     try:
@@ -1330,6 +1487,7 @@ def send_email_message(site, to_email, subject, body_text):
             'from_name': from_name,
             'reply_to_email': reply_to_email,
             'transport_mode': profile.get('transport_mode') or 'platform_smtp',
+            'message_id': message_id,
         }
         log_mail_event('SMTP_SEND_SUCCESS', result)
         return result
@@ -1344,6 +1502,7 @@ def send_email_message(site, to_email, subject, body_text):
             'from_name': from_name,
             'reply_to_email': reply_to_email,
             'transport_mode': profile.get('transport_mode') or 'platform_smtp',
+            'message_id': message_id,
             'error': str(exc),
         }
         log_mail_event('SMTP_SEND_ERROR', result)
@@ -1411,6 +1570,8 @@ def send_manual_lead_email(site_data, lead, subject, body_text, status_after_sen
         'reply_to_email': mail_result.get('reply_to_email') or '',
         'mode': mail_result.get('mode') or '',
         'delivery_mode': mail_result.get('delivery_mode') or 'platform_domain',
+        'message_id': mail_result.get('message_id') or '',
+        'outbound_message_id': mail_result.get('message_id') or '',
     }
     if mail_result.get('error'):
         payload['error'] = mail_result.get('error')
