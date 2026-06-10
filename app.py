@@ -1839,6 +1839,9 @@ def persist_mail_event_async(site_id, lead_id, event_type, payload):
 
 def send_ack_email_async(site_data, lead, site_id, lead_id):
     try:
+        lead = dict(lead or {})
+        if lead_id and not lead.get('id'):
+            lead['id'] = lead_id
         recipient = (lead.get('email') or '').strip()
         if not recipient:
             payload = {'ok': False, 'mode': 'skipped', 'error': 'Missing recipient email.'}
@@ -2827,9 +2830,13 @@ def lead_events():
         }
         log_mail_event('AUTO_ACK_QUEUED', {'site_id': site['id'], 'lead_id': lead_id, **queued_payload})
         create_lead_event(conn, site['id'], lead_id, 'auto_ack_queued', queued_payload, now_iso())
+        ack_lead = dict(lead)
+        ack_lead['id'] = lead_id
+        ack_lead['site_id'] = site['id']
+        ack_lead['status'] = next_status
         threading.Thread(
             target=send_ack_email_async,
-            args=(site_data, dict(lead), site['id'], lead_id),
+            args=(site_data, ack_lead, site['id'], lead_id),
             daemon=True,
         ).start()
     else:
