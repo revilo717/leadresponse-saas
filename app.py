@@ -1227,6 +1227,52 @@ def recent_unmatched_reply_events(site_id, limit=20):
     return items
 
 
+def recent_inbound_fetch_audit_events(site_id, limit=50):
+    rows = db().execute(
+        sql('SELECT * FROM lead_events WHERE site_id = ? AND event_type = ? ORDER BY id DESC LIMIT ?'),
+        (site_id, 'inbound_reply_fetch_audit', int(limit))
+    ).fetchall()
+    items = []
+    for row in rows:
+        event = row_to_dict(row)
+        payload = parse_payload(event.get('payload_json'))
+        items.append({
+            'created_at': event.get('created_at') or '',
+            'from_email': payload.get('from_email') or '',
+            'to_email': payload.get('to_email') or '',
+            'subject': payload.get('subject') or '',
+            'folder': payload.get('folder') or '',
+            'message_id': payload.get('message_id') or '',
+            'in_reply_to': payload.get('in_reply_to') or '',
+            'references': payload.get('references') or '',
+            'lead_reply_token': payload.get('lead_reply_token') or '',
+            'result': payload.get('result') or '',
+            'reason': payload.get('reason') or '',
+            'matched_via': payload.get('matched_via') or '',
+            'lead_id': payload.get('lead_id') or '',
+            'sent_at': payload.get('sent_at') or '',
+        })
+    return items
+
+
+def latest_inbound_fetch_summary(site_id):
+    row = db().execute(
+        sql('SELECT * FROM lead_events WHERE site_id = ? AND event_type = ? ORDER BY id DESC LIMIT 1'),
+        (site_id, 'inbound_reply_fetch_summary')
+    ).fetchone()
+    if not row:
+        return {}
+    event = row_to_dict(row)
+    payload = parse_payload(event.get('payload_json'))
+    return {
+        'created_at': event.get('created_at') or '',
+        'folder': payload.get('folder') or '',
+        'lookback_days': payload.get('lookback_days') or 0,
+        'fetched_count': payload.get('fetched_count') or 0,
+        'message_numbers_preview': payload.get('message_numbers_preview') or [],
+    }
+
+
 def sort_events_newest_first(events):
     return sorted(
         [event for event in (events or []) if isinstance(event, dict)],
@@ -1502,6 +1548,19 @@ def poll_inbound_replies_for_site(site):
         mailbox.login(username, password)
         mailbox.select(folder)
         message_nums = fetch_recent_imap_message_numbers(mailbox, lookback_days)
+        fetch_summary = {
+            'folder': folder,
+            'lookback_days': lookback_days,
+            'fetched_count': len(message_nums),
+            'message_numbers_preview': [num.decode('utf-8', errors='ignore') if isinstance(num, (bytes, bytearray)) else str(num) for num in list(message_nums)[:20]],
+        }
+        summary_conn = connect_db()
+        try:
+            create_lead_event(summary_conn, site_data['id'], None, 'inbound_reply_fetch_summary', fetch_summary, now_iso())
+            summary_conn.commit()
+        finally:
+            summary_conn.close()
+        log_mail_event('INBOUND_REPLY_FETCH_SUMMARY', {'site_id': site_data['id'], **fetch_summary})
 
         for num in message_nums:
             typ, fetched = mailbox.fetch(num, '(BODY.PEEK[])')
@@ -1520,8 +1579,11 @@ def poll_inbound_replies_for_site(site):
             if not sender_email:
                 continue
 
+            to_email = extract_email_address(message.get('To'))
             message_id = decode_email_header_value(message.get('Message-ID') or '').strip()
             subject = decode_email_header_value(message.get('Subject') or '').strip()
+            token_site_id, token_lead_id = extract_lead_reply_token(subject)
+            lead_reply_token = make_lead_reply_token(token_site_id, token_lead_id) if token_lead_id else ''
             body_text_raw = extract_message_text(message)
             body_text_clean = clean_inbound_reply_text(body_text_raw)
             body_text_preview = reply_preview_text(body_text_clean or body_text_raw)
@@ -1546,6 +1608,24 @@ def poll_inbound_replies_for_site(site):
                         ('customer_reply_received', f'%{reply_fingerprint}%')
                     ).fetchone()
                 if duplicate:
+                    audit_payload = {
+                        'from_email': sender_email,
+                        'to_email': to_email,
+                        'subject': subject,
+                        'folder': folder,
+                        'message_id': message_id,
+                        'in_reply_to': in_reply_to,
+                        'references': references,
+                        'lead_reply_token': lead_reply_token,
+                        'sent_at': sent_at,
+                        'result': 'duplicate',
+                        'reason': 'message_id_or_fingerprint_already_seen',
+                        'matched_via': '',
+                        'lead_id': '',
+                    }
+                    create_lead_event(conn, site_data['id'], None, 'inbound_reply_fetch_audit', audit_payload, now_iso())
+                    conn.commit()
+                    log_mail_event('INBOUND_REPLY_FETCH_AUDIT', {'site_id': site_data['id'], **audit_payload})
                     continue
 
                 lead_row, matched_via = resolve_inbound_reply_lead(
@@ -1566,12 +1646,29 @@ def poll_inbound_replies_for_site(site):
                         'references': references,
                         'unmatched_reason': matched_via or 'unknown',
                     }
+                    audit_payload = {
+                        'from_email': sender_email,
+                        'to_email': to_email,
+                        'subject': subject,
+                        'folder': folder,
+                        'message_id': message_id,
+                        'in_reply_to': in_reply_to,
+                        'references': references,
+                        'lead_reply_token': lead_reply_token,
+                        'sent_at': sent_at,
+                        'result': 'unmatched',
+                        'reason': matched_via or 'unknown',
+                        'matched_via': '',
+                        'lead_id': '',
+                    }
                     create_lead_event(conn, site_data['id'], None, 'inbound_reply_unmatched', unmatched_payload, now_iso())
+                    create_lead_event(conn, site_data['id'], None, 'inbound_reply_fetch_audit', audit_payload, now_iso())
                     conn.commit()
                     log_mail_event('INBOUND_REPLY_UNMATCHED', {
                         'site_id': site_data['id'],
                         **unmatched_payload,
                     })
+                    log_mail_event('INBOUND_REPLY_FETCH_AUDIT', {'site_id': site_data['id'], **audit_payload})
                     continue
 
                 lead = row_to_dict(lead_row)
@@ -1604,6 +1701,23 @@ def poll_inbound_replies_for_site(site):
                 update_lead_status(conn, lead['id'], 'open', new_notes)
                 conn.commit()
                 processed += 1
+                audit_payload = {
+                    'from_email': sender_email,
+                    'to_email': to_email,
+                    'subject': subject,
+                    'folder': folder,
+                    'message_id': message_id,
+                    'in_reply_to': in_reply_to,
+                    'references': references,
+                    'lead_reply_token': lead_reply_token,
+                    'sent_at': sent_at,
+                    'result': 'matched',
+                    'reason': '',
+                    'matched_via': matched_via,
+                    'lead_id': lead['id'],
+                }
+                create_lead_event(conn, site_data['id'], None, 'inbound_reply_fetch_audit', audit_payload, now_iso())
+                conn.commit()
                 log_mail_event('INBOUND_REPLY_MATCHED', {
                     'site_id': site_data['id'],
                     'lead_id': lead['id'],
@@ -1612,6 +1726,7 @@ def poll_inbound_replies_for_site(site):
                     'folder': folder,
                     'matched_via': matched_via,
                 })
+                log_mail_event('INBOUND_REPLY_FETCH_AUDIT', {'site_id': site_data['id'], **audit_payload})
                 notification = notify_client_of_inbound_reply(site_data, lead, payload)
                 if notification:
                     log_mail_event('INBOUND_REPLY_CLIENT_NOTIFIED', {
@@ -3085,6 +3200,8 @@ def replies_diagnostics_api():
         'last_reply_sync_at': site_data.get('last_reply_sync_at') or '',
         'last_reply_sync_count': int(site_data.get('last_reply_sync_count') or 0),
         'last_reply_sync_error': site_data.get('last_reply_sync_error') or '',
+        'latest_fetch_summary': latest_inbound_fetch_summary(site['id']),
+        'recent_fetch_audit': recent_inbound_fetch_audit_events(site['id'], 20),
         'recent_unmatched_replies': recent_unmatched_reply_events(site['id'], 20),
     })
 
