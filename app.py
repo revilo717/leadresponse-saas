@@ -1294,6 +1294,45 @@ def find_lead_by_thread_headers(conn, site_id, sender_email, in_reply_to, refere
     return None, 'thread_header_lead_not_found'
 
 
+def find_lead_by_subject_rewrite_fallback(conn, site_id, sender_email, subject, sent_at):
+    inbound_subject = normalize_thread_subject(subject)
+    if not inbound_subject:
+        return None, 'missing_subject_for_rewrite_fallback'
+
+    inbound_dt = parse_email_datetime(sent_at)
+    candidate_lead_ids = []
+    outbound_events = recent_outbound_thread_events(conn, site_id, sender_email)
+
+    for event in outbound_events:
+        lead_id = int(event.get('lead_id') or 0)
+        if not lead_id:
+            continue
+        outbound_payload = event.get('payload') or {}
+        outbound_subject = normalize_thread_subject(outbound_payload.get('subject') or '')
+        if not outbound_subject or outbound_subject != inbound_subject:
+            continue
+
+        outbound_dt = event_occurred_dt(event)
+        if outbound_dt and datetime.now(timezone.utc) - outbound_dt > timedelta(days=30):
+            continue
+        if inbound_dt and outbound_dt and inbound_dt + timedelta(minutes=2) < outbound_dt:
+            continue
+
+        if lead_id not in candidate_lead_ids:
+            candidate_lead_ids.append(lead_id)
+
+    if len(candidate_lead_ids) != 1:
+        return None, 'ambiguous_subject_match' if candidate_lead_ids else 'no_subject_match'
+
+    lead_row = conn.execute(
+        sql('SELECT * FROM leads WHERE id = ? AND site_id = ? LIMIT 1'),
+        (candidate_lead_ids[0], site_id)
+    ).fetchone()
+    if lead_row:
+        return lead_row, 'subject_rewrite_fallback'
+    return None, 'subject_match_lead_not_found'
+
+
 def find_lead_by_safe_fallback(conn, site_id, sender_email, subject, sent_at):
     outbound_events = recent_outbound_thread_events(conn, site_id, sender_email)
     unique_lead_ids = []
@@ -1339,12 +1378,20 @@ def resolve_inbound_reply_lead(conn, site_id, sender_email, subject, in_reply_to
     lead_row, matched_via = find_lead_by_thread_headers(conn, site_id, sender_email, in_reply_to, references)
     if lead_row:
         return lead_row, matched_via
+
+    subject_row, subject_reason = find_lead_by_subject_rewrite_fallback(conn, site_id, sender_email, subject, sent_at)
+    if subject_row:
+        return subject_row, subject_reason
+
     fallback_row, fallback_reason = find_lead_by_safe_fallback(conn, site_id, sender_email, subject, sent_at)
     if fallback_row:
         return fallback_row, fallback_reason
-    if matched_via:
-        return None, matched_via
-    return None, fallback_reason
+
+    reasons = []
+    for value in (matched_via, subject_reason, fallback_reason):
+        if value and value not in reasons:
+            reasons.append(value)
+    return None, ' | '.join(reasons) if reasons else 'unknown'
 
 
 def save_reply_sync_status(site_id, checked_at, replies_ingested=0, error=''):
