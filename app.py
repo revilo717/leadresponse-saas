@@ -1138,8 +1138,12 @@ def extract_header_message_ids(value):
     return [token for token in tokens if token]
 
 
+LEAD_REPLY_TOKEN_RE = re.compile(r'\[LR-([0-9]+)-([0-9]+)\]', re.IGNORECASE)
+
+
 def normalize_thread_subject(value):
     text = re.sub(r'^(re|fw|fwd)\s*:\s*', '', (value or '').strip(), flags=re.IGNORECASE)
+    text = LEAD_REPLY_TOKEN_RE.sub('', text)
     return re.sub(r'\s+', ' ', text).strip().lower()
 
 
@@ -1248,6 +1252,53 @@ def outbound_message_ids_from_payload(payload):
         if token:
             values.append(token)
     return values
+
+
+def make_lead_reply_token(site_id, lead_id):
+    try:
+        site_token = int(site_id or 0)
+        lead_token = int(lead_id or 0)
+    except Exception:
+        return ''
+    if site_token <= 0 or lead_token <= 0:
+        return ''
+    return f'[LR-{site_token}-{lead_token}]'
+
+
+def subject_with_lead_reply_token(subject, site_id, lead_id):
+    subject = (subject or '').strip()
+    token = make_lead_reply_token(site_id, lead_id)
+    if not token:
+        return subject
+    if LEAD_REPLY_TOKEN_RE.search(subject):
+        return subject
+    return f'{subject} {token}'.strip()
+
+
+def extract_lead_reply_token(subject):
+    match = LEAD_REPLY_TOKEN_RE.search(subject or '')
+    if not match:
+        return 0, 0
+    try:
+        return int(match.group(1)), int(match.group(2))
+    except Exception:
+        return 0, 0
+
+
+def find_lead_by_subject_token(conn, site_id, subject):
+    token_site_id, token_lead_id = extract_lead_reply_token(subject)
+    if token_lead_id <= 0:
+        return None, 'no_subject_token'
+    if token_site_id and int(token_site_id) != int(site_id or 0):
+        return None, 'subject_token_site_mismatch'
+
+    lead_row = conn.execute(
+        sql('SELECT * FROM leads WHERE id = ? AND site_id = ? LIMIT 1'),
+        (token_lead_id, site_id)
+    ).fetchone()
+    if lead_row:
+        return lead_row, 'subject_token'
+    return None, 'subject_token_lead_not_found'
 
 
 def recent_outbound_thread_events(conn, site_id, recipient_email=None, limit=800):
@@ -1375,6 +1426,10 @@ def find_lead_by_safe_fallback(conn, site_id, sender_email, subject, sent_at):
 
 
 def resolve_inbound_reply_lead(conn, site_id, sender_email, subject, in_reply_to, references, sent_at):
+    token_row, token_reason = find_lead_by_subject_token(conn, site_id, subject)
+    if token_row:
+        return token_row, token_reason
+
     lead_row, matched_via = find_lead_by_thread_headers(conn, site_id, sender_email, in_reply_to, references)
     if lead_row:
         return lead_row, matched_via
@@ -1388,7 +1443,7 @@ def resolve_inbound_reply_lead(conn, site_id, sender_email, subject, in_reply_to
         return fallback_row, fallback_reason
 
     reasons = []
-    for value in (matched_via, subject_reason, fallback_reason):
+    for value in (token_reason, matched_via, subject_reason, fallback_reason):
         if value and value not in reasons:
             reasons.append(value)
     return None, ' | '.join(reasons) if reasons else 'unknown'
@@ -1642,10 +1697,26 @@ def update_lead_status(conn, lead_id, status=None, notes=None):
         conn.execute(sql('UPDATE leads SET notes = ? WHERE id = ?'), (notes, lead_id))
 
 
-def send_email_message(site, to_email, subject, body_text):
+def send_email_message(site, to_email, subject, body_text, lead=None):
     to_email = (to_email or '').strip()
     if not to_email:
         return {'ok': False, 'mode': 'skipped', 'error': 'Missing recipient email.'}
+
+    subject = (subject or '').strip()
+    lead_id = 0
+    if isinstance(lead, dict):
+        try:
+            lead_id = int(lead.get('id') or 0)
+        except Exception:
+            lead_id = 0
+    site_id = 0
+    if isinstance(site, dict):
+        try:
+            site_id = int(site.get('id') or 0)
+        except Exception:
+            site_id = 0
+    lead_reply_token = make_lead_reply_token(site_id, lead_id)
+    subject = subject_with_lead_reply_token(subject, site_id, lead_id) if lead_reply_token else subject
 
     profile = resolve_mail_profile(site)
     if profile.get('transport_mode') == 'site_smtp':
@@ -1678,6 +1749,7 @@ def send_email_message(site, to_email, subject, body_text):
             'from_name': from_name,
             'reply_to_email': reply_to_email,
             'transport_mode': profile.get('transport_mode') or 'platform_smtp',
+            'lead_reply_token': lead_reply_token,
             'message_id': message_id,
         }
         log_mail_event('SMTP_SIMULATION', result)
@@ -1707,6 +1779,7 @@ def send_email_message(site, to_email, subject, body_text):
         'delivery_mode': profile.get('delivery_mode') or 'platform_domain',
         'transport_mode': profile.get('transport_mode') or 'platform_smtp',
         'subject': subject,
+        'lead_reply_token': lead_reply_token,
         'message_id': message_id,
     })
 
@@ -1731,6 +1804,7 @@ def send_email_message(site, to_email, subject, body_text):
             'from_name': from_name,
             'reply_to_email': reply_to_email,
             'transport_mode': profile.get('transport_mode') or 'platform_smtp',
+            'lead_reply_token': lead_reply_token,
             'message_id': message_id,
         }
         log_mail_event('SMTP_SEND_SUCCESS', result)
@@ -1746,6 +1820,7 @@ def send_email_message(site, to_email, subject, body_text):
             'from_name': from_name,
             'reply_to_email': reply_to_email,
             'transport_mode': profile.get('transport_mode') or 'platform_smtp',
+            'lead_reply_token': lead_reply_token,
             'message_id': message_id,
             'error': str(exc),
         }
@@ -1773,8 +1848,8 @@ def send_ack_email_async(site_data, lead, site_id, lead_id):
 
         log_mail_event('AUTO_ACK_START', {'site_id': site_id, 'lead_id': lead_id, 'to': recipient})
         subject, body = build_ack_email(site_data, lead)
-        mail_result = send_email_message(site_data, recipient, subject, body)
-        event_payload = {**mail_result, 'subject': subject, 'body_text': body}
+        mail_result = send_email_message(site_data, recipient, subject, body, lead=lead)
+        event_payload = {**mail_result, 'subject': mail_result.get('subject') or subject, 'body_text': body}
         event_type = 'auto_ack_sent' if mail_result.get('ok') else 'auto_ack_failed'
         log_mail_event('AUTO_ACK_RESULT', {'site_id': site_id, 'lead_id': lead_id, 'event_type': event_type, **event_payload})
         persist_mail_event_async(site_id, lead_id, event_type, event_payload)
@@ -1804,10 +1879,10 @@ def send_manual_lead_email(site_data, lead, subject, body_text, status_after_sen
     if not subject or not body_text:
         return {'ok': False, 'mode': 'skipped', 'error': 'Subject and body are required.'}
 
-    mail_result = send_email_message(site_data, recipient, subject, body_text)
+    mail_result = send_email_message(site_data, recipient, subject, body_text, lead=lead)
     payload = {
         'to': recipient,
-        'subject': subject,
+        'subject': mail_result.get('subject') or subject,
         'body_text': body_text,
         'from_email': mail_result.get('from_email') or '',
         'from_name': mail_result.get('from_name') or '',
@@ -3066,8 +3141,8 @@ def run_automation_api():
             continue
 
         subject, body = build_follow_up_email(site_data, lead, step_to_send)
-        result = send_email_message(site_data, (lead.get('email') or '').strip(), subject, body)
-        event_payload = {**result, 'subject': subject, 'body_text': body, 'step_number': step_to_send}
+        result = send_email_message(site_data, (lead.get('email') or '').strip(), subject, body, lead=lead)
+        event_payload = {**result, 'subject': result.get('subject') or subject, 'body_text': body, 'step_number': step_to_send}
         create_lead_event(conn, site['id'], lead['id'], f'follow_up_{step_to_send}_sent', event_payload, now_iso())
         follow_ups_sent += 1
 
