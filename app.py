@@ -1202,6 +1202,27 @@ def event_occurred_at_iso(event):
     return iso_from_dt(event_occurred_dt(event), (event or {}).get('created_at') or '')
 
 
+def recent_unmatched_reply_events(site_id, limit=20):
+    rows = db().execute(
+        sql('SELECT * FROM lead_events WHERE site_id = ? AND event_type = ? ORDER BY id DESC LIMIT ?'),
+        (site_id, 'inbound_reply_unmatched', int(limit))
+    ).fetchall()
+    items = []
+    for row in rows:
+        event = row_to_dict(row)
+        payload = parse_payload(event.get('payload_json'))
+        items.append({
+            'created_at': event.get('created_at') or '',
+            'from_email': payload.get('from_email') or '',
+            'subject': payload.get('subject') or '',
+            'folder': payload.get('folder') or '',
+            'in_reply_to': payload.get('in_reply_to') or '',
+            'references': payload.get('references') or '',
+            'unmatched_reason': payload.get('unmatched_reason') or 'unknown',
+        })
+    return items
+
+
 def sort_events_newest_first(events):
     return sorted(
         [event for event in (events or []) if isinstance(event, dict)],
@@ -1435,14 +1456,19 @@ def poll_inbound_replies_for_site(site):
                     sent_at,
                 )
                 if not lead_row:
-                    log_mail_event('INBOUND_REPLY_UNMATCHED', {
-                        'site_id': site_data['id'],
+                    unmatched_payload = {
                         'from_email': sender_email,
                         'subject': subject,
                         'folder': folder,
                         'in_reply_to': in_reply_to,
                         'references': references,
                         'unmatched_reason': matched_via or 'unknown',
+                    }
+                    create_lead_event(conn, site_data['id'], None, 'inbound_reply_unmatched', unmatched_payload, now_iso())
+                    conn.commit()
+                    log_mail_event('INBOUND_REPLY_UNMATCHED', {
+                        'site_id': site_data['id'],
+                        **unmatched_payload,
                     })
                     continue
 
@@ -2909,6 +2935,28 @@ def check_replies_api():
         'message': sync_result.get('message') or 'Reply sync completed.',
         'error': sync_result.get('error') or '',
         'item': public,
+    })
+
+
+@app.route('/api/v1/replies/diagnostics', methods=['GET'])
+def replies_diagnostics_api():
+    site_token = (request.args.get('site_token') or '').strip()
+    site_secret = (request.args.get('site_secret') or '').strip()
+
+    site = get_site_by_token(site_token)
+    if not site:
+        return jsonify({'error': 'Invalid site token.'}), 404
+    if not site_secret or site_secret != site['site_secret']:
+        return jsonify({'error': 'Invalid site secret.'}), 403
+
+    site_data = row_to_dict(site)
+    return jsonify({
+        'success': True,
+        'imap_configured': imap_is_configured(),
+        'last_reply_sync_at': site_data.get('last_reply_sync_at') or '',
+        'last_reply_sync_count': int(site_data.get('last_reply_sync_count') or 0),
+        'last_reply_sync_error': site_data.get('last_reply_sync_error') or '',
+        'recent_unmatched_replies': recent_unmatched_reply_events(site['id'], 20),
     })
 
 
