@@ -14,7 +14,7 @@ import smtplib
 import ssl
 import threading
 from email.message import EmailMessage
-from email.utils import parseaddr, make_msgid, parsedate_to_datetime
+from email.utils import parseaddr, make_msgid, parsedate_to_datetime, getaddresses
 from email.header import decode_header, make_header
 
 try:
@@ -786,6 +786,13 @@ def get_white_label_settings(site):
     settings['email_template_defaults'] = dict(EMAIL_TEMPLATE_DEFAULTS)
     settings['email_dns_records'] = build_email_dns_records(settings)
     settings['email_dns_steps'] = build_email_dns_steps(settings)
+    settings['lead_inbox_reply_domain'] = reply_inbox_domain()
+    settings['lead_inbox_reply_pattern'] = f"reply+s{{site_id}}+l{{lead_id}}+h{{hash}}@{settings['lead_inbox_reply_domain']}" if settings['lead_inbox_reply_domain'] else ''
+    if settings['reply_handling_mode'] == 'lead_inbox':
+        settings['reply_route_summary'] = f"Lead Inbox replies route back to LeadResponse via {settings['lead_inbox_reply_domain']}."
+    else:
+        target_email = settings.get('reply_to_email') or ''
+        settings['reply_route_summary'] = f"Client Mailbox mode sends replies to {target_email or 'the configured client mailbox'}."
     settings['dns_pack_summary'] = 'Email branding normally needs a DNS pack (TXT / CNAME / MX / DMARC), not just one CNAME.'
     settings['activation_summary'] = 'LeadResponse stays in platform fallback mode until the branded email domain is verified.'
     return settings
@@ -813,6 +820,8 @@ def resolve_mail_profile(site):
         'smtp_password': white_label.get('smtp_password') or '',
         'smtp_use_ssl': 1 if coerce_bool(white_label.get('smtp_use_ssl'), False) else 0,
         'smtp_use_tls': 1 if coerce_bool(white_label.get('smtp_use_tls'), True) else 0,
+        'lead_inbox_reply_domain': white_label.get('lead_inbox_reply_domain') or reply_inbox_domain(),
+        'lead_inbox_reply_pattern': white_label.get('lead_inbox_reply_pattern') or '',
     }
 
 
@@ -821,6 +830,8 @@ def public_white_label_settings(site):
     settings['smtp_password'] = ''
     settings['smtp_password_saved'] = bool(settings.get('smtp_password_saved'))
     settings['imap_configured'] = imap_is_configured()
+    settings['lead_inbox_reply_domain'] = settings.get('lead_inbox_reply_domain') or reply_inbox_domain()
+    settings['lead_inbox_reply_pattern'] = settings.get('lead_inbox_reply_pattern') or (f"reply+s{{site_id}}+l{{lead_id}}+h{{hash}}@{settings['lead_inbox_reply_domain']}" if settings.get('lead_inbox_reply_domain') else '')
     return settings
 
 
@@ -936,6 +947,114 @@ def decode_email_header_value(value):
 
 def extract_email_address(value):
     return (parseaddr(value or '')[1] or '').strip().lower()
+
+
+def reply_inbox_domain():
+    domain = (os.getenv('LEAD_INBOX_REPLY_DOMAIN') or '').strip().lower()
+    if domain:
+        return domain
+    imap_username = clean_email_value(os.getenv('IMAP_USERNAME') or '')
+    if imap_username and '@' in imap_username:
+        return imap_username.split('@', 1)[1].lower()
+    return 'reply.leadresponse.local'
+
+
+def lead_reply_secret():
+    return (os.getenv('LEAD_REPLY_SECRET') or os.getenv('SECRET_KEY') or 'leadresponse-reply-secret').strip()
+
+
+def make_lead_reply_hash(site_id, lead_id):
+    try:
+        site_id = int(site_id or 0)
+        lead_id = int(lead_id or 0)
+    except Exception:
+        return ''
+    if site_id <= 0 or lead_id <= 0:
+        return ''
+    raw = f'{site_id}:{lead_id}:{lead_reply_secret()}'.encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()[:10]
+
+
+def make_lead_reply_alias(site_id, lead_id):
+    try:
+        site_id = int(site_id or 0)
+        lead_id = int(lead_id or 0)
+    except Exception:
+        return ''
+    if site_id <= 0 or lead_id <= 0:
+        return ''
+    token_hash = make_lead_reply_hash(site_id, lead_id)
+    if not token_hash:
+        return ''
+    return f'reply+s{site_id}+l{lead_id}+h{token_hash}'
+
+
+def make_lead_reply_address(site_id, lead_id):
+    alias = make_lead_reply_alias(site_id, lead_id)
+    domain = reply_inbox_domain()
+    if not alias or not domain:
+        return ''
+    return f'{alias}@{domain}'
+
+
+def extract_message_recipient_addresses(message):
+    values = []
+    for header in ('Delivered-To', 'Envelope-To', 'X-Original-To', 'X-Envelope-To', 'To', 'Cc', 'Resent-To'):
+        for raw in message.get_all(header, []):
+            decoded = decode_email_header_value(raw or '').strip()
+            if decoded:
+                values.append(decoded)
+    addresses = []
+    seen = set()
+    for _, email_addr in getaddresses(values):
+        cleaned = clean_email_value(email_addr)
+        if cleaned and cleaned not in seen:
+            addresses.append(cleaned)
+            seen.add(cleaned)
+    return addresses
+
+
+def extract_lead_reply_alias_from_message(message):
+    for email_addr in extract_message_recipient_addresses(message):
+        local_part, sep, domain = email_addr.partition('@')
+        if not sep:
+            continue
+        if domain.lower() != reply_inbox_domain():
+            continue
+        match = LEAD_REPLY_ALIAS_RE.match(local_part or '')
+        if not match:
+            continue
+        try:
+            site_id = int(match.group(1))
+            lead_id = int(match.group(2))
+        except Exception:
+            return {
+                'site_id': 0,
+                'lead_id': 0,
+                'valid': False,
+                'hash': '',
+                'email': email_addr,
+                'reason': 'invalid_reply_alias',
+            }
+        alias_hash = (match.group(3) or '').lower()
+        expected_hash = make_lead_reply_hash(site_id, lead_id)
+        is_valid = bool(expected_hash and alias_hash == expected_hash)
+        return {
+            'site_id': site_id,
+            'lead_id': lead_id,
+            'valid': is_valid,
+            'hash': alias_hash,
+            'email': email_addr,
+            'reason': 'reply_alias' if is_valid else 'invalid_reply_alias_hash',
+        }
+    return {
+        'site_id': 0,
+        'lead_id': 0,
+        'valid': False,
+        'hash': '',
+        'email': '',
+        'reason': 'no_reply_alias',
+    }
 
 
 def strip_html_to_text(value):
@@ -1139,6 +1258,7 @@ def extract_header_message_ids(value):
 
 
 LEAD_REPLY_TOKEN_RE = re.compile(r'\[LR-([0-9]+)-([0-9]+)\]', re.IGNORECASE)
+LEAD_REPLY_ALIAS_RE = re.compile(r'^reply\+s([0-9]+)\+l([0-9]+)\+h([a-f0-9]{6,64})$', re.IGNORECASE)
 
 
 def normalize_thread_subject(value):
@@ -1347,6 +1467,27 @@ def find_lead_by_subject_token(conn, site_id, subject):
     return None, 'subject_token_lead_not_found'
 
 
+def find_lead_by_reply_alias(conn, site_id, alias_site_id, alias_lead_id, alias_is_valid):
+    try:
+        alias_site_id = int(alias_site_id or 0)
+        alias_lead_id = int(alias_lead_id or 0)
+    except Exception:
+        return None, 'invalid_reply_alias'
+    if alias_lead_id <= 0:
+        return None, 'no_reply_alias'
+    if not alias_is_valid:
+        return None, 'invalid_reply_alias_hash'
+    if alias_site_id and int(alias_site_id) != int(site_id or 0):
+        return None, 'reply_alias_other_site'
+    lead_row = conn.execute(
+        sql('SELECT * FROM leads WHERE id = ? AND site_id = ? LIMIT 1'),
+        (alias_lead_id, site_id)
+    ).fetchone()
+    if lead_row:
+        return lead_row, 'reply_alias'
+    return None, 'reply_alias_lead_not_found'
+
+
 def recent_outbound_thread_events(conn, site_id, recipient_email=None, limit=800):
     rows = conn.execute(
         sql('SELECT * FROM lead_events WHERE site_id = ? ORDER BY id DESC LIMIT ?'),
@@ -1471,7 +1612,11 @@ def find_lead_by_safe_fallback(conn, site_id, sender_email, subject, sent_at):
     return lead_row, 'single_recent_outbound_fallback'
 
 
-def resolve_inbound_reply_lead(conn, site_id, sender_email, subject, in_reply_to, references, sent_at):
+def resolve_inbound_reply_lead(conn, site_id, sender_email, subject, in_reply_to, references, sent_at, alias_site_id=0, alias_lead_id=0, alias_is_valid=False):
+    alias_row, alias_reason = find_lead_by_reply_alias(conn, site_id, alias_site_id, alias_lead_id, alias_is_valid)
+    if alias_row:
+        return alias_row, alias_reason
+
     token_row, token_reason = find_lead_by_subject_token(conn, site_id, subject)
     if token_row:
         return token_row, token_reason
@@ -1489,8 +1634,8 @@ def resolve_inbound_reply_lead(conn, site_id, sender_email, subject, in_reply_to
         return fallback_row, fallback_reason
 
     reasons = []
-    for value in (token_reason, matched_via, subject_reason, fallback_reason):
-        if value and value not in reasons:
+    for value in (alias_reason, token_reason, matched_via, subject_reason, fallback_reason):
+        if value and value not in reasons and value != 'reply_alias_other_site':
             reasons.append(value)
     return None, ' | '.join(reasons) if reasons else 'unknown'
 
@@ -1584,6 +1729,13 @@ def poll_inbound_replies_for_site(site):
             subject = decode_email_header_value(message.get('Subject') or '').strip()
             token_site_id, token_lead_id = extract_lead_reply_token(subject)
             lead_reply_token = make_lead_reply_token(token_site_id, token_lead_id) if token_lead_id else ''
+            alias_data = extract_lead_reply_alias_from_message(message)
+            alias_site_id = int(alias_data.get('site_id') or 0)
+            alias_lead_id = int(alias_data.get('lead_id') or 0)
+            alias_is_valid = bool(alias_data.get('valid'))
+            lead_reply_alias_email = alias_data.get('email') or ''
+            if alias_site_id and alias_site_id != int(site_data['id'] or 0):
+                continue
             body_text_raw = extract_message_text(message)
             body_text_clean = clean_inbound_reply_text(body_text_raw)
             body_text_preview = reply_preview_text(body_text_clean or body_text_raw)
@@ -1611,12 +1763,15 @@ def poll_inbound_replies_for_site(site):
                     audit_payload = {
                         'from_email': sender_email,
                         'to_email': to_email,
+                        'delivered_to': lead_reply_alias_email or to_email,
                         'subject': subject,
                         'folder': folder,
                         'message_id': message_id,
                         'in_reply_to': in_reply_to,
                         'references': references,
                         'lead_reply_token': lead_reply_token,
+                        'reply_alias_email': lead_reply_alias_email,
+                        'reply_alias_valid': alias_is_valid,
                         'sent_at': sent_at,
                         'result': 'duplicate',
                         'reason': 'message_id_or_fingerprint_already_seen',
@@ -1636,10 +1791,17 @@ def poll_inbound_replies_for_site(site):
                     in_reply_to,
                     references,
                     sent_at,
+                    alias_site_id,
+                    alias_lead_id,
+                    alias_is_valid,
                 )
                 if not lead_row:
                     unmatched_payload = {
                         'from_email': sender_email,
+                        'to_email': to_email,
+                        'delivered_to': lead_reply_alias_email or to_email,
+                        'reply_alias_email': lead_reply_alias_email,
+                        'reply_alias_valid': alias_is_valid,
                         'subject': subject,
                         'folder': folder,
                         'in_reply_to': in_reply_to,
@@ -1649,6 +1811,9 @@ def poll_inbound_replies_for_site(site):
                     audit_payload = {
                         'from_email': sender_email,
                         'to_email': to_email,
+                        'delivered_to': lead_reply_alias_email or to_email,
+                        'reply_alias_email': lead_reply_alias_email,
+                        'reply_alias_valid': alias_is_valid,
                         'subject': subject,
                         'folder': folder,
                         'message_id': message_id,
@@ -1676,6 +1841,10 @@ def poll_inbound_replies_for_site(site):
                 payload = {
                     'from_name': from_name,
                     'from_email': sender_email,
+                    'to_email': to_email,
+                    'delivered_to': lead_reply_alias_email or to_email,
+                    'reply_alias_email': lead_reply_alias_email,
+                    'reply_alias_valid': alias_is_valid,
                     'subject': subject,
                     'body_text': body_text,
                     'body_text_clean': body_text_clean,
@@ -1704,6 +1873,9 @@ def poll_inbound_replies_for_site(site):
                 audit_payload = {
                     'from_email': sender_email,
                     'to_email': to_email,
+                    'delivered_to': lead_reply_alias_email or to_email,
+                    'reply_alias_email': lead_reply_alias_email,
+                    'reply_alias_valid': alias_is_valid,
                     'subject': subject,
                     'folder': folder,
                     'message_id': message_id,
@@ -1851,6 +2023,14 @@ def send_email_message(site, to_email, subject, body_text, lead=None):
     from_email = (profile.get('from_email') or os.getenv('MAIL_FROM') or username or 'no-reply@leadresponse.local').strip()
     from_name = (profile.get('from_name') or os.getenv('MAIL_FROM_NAME') or 'LeadResponse').strip()
     reply_to_email = (profile.get('reply_to_email') or '').strip()
+    lead_reply_alias_email = ''
+    reply_routing_mode = 'client_mailbox' if profile.get('reply_handling_mode') == 'client_email' else 'lead_inbox_alias'
+    if profile.get('reply_handling_mode') == 'lead_inbox':
+        lead_reply_alias_email = make_lead_reply_address(site_id, lead_id)
+        if lead_reply_alias_email:
+            reply_to_email = lead_reply_alias_email
+        else:
+            reply_routing_mode = 'lead_inbox_headers_fallback'
     message_id = make_msgid()
 
     if not host:
@@ -1863,6 +2043,8 @@ def send_email_message(site, to_email, subject, body_text, lead=None):
             'from_email': from_email,
             'from_name': from_name,
             'reply_to_email': reply_to_email,
+            'reply_routing_mode': reply_routing_mode,
+            'lead_reply_alias_email': lead_reply_alias_email,
             'transport_mode': profile.get('transport_mode') or 'platform_smtp',
             'lead_reply_token': lead_reply_token,
             'message_id': message_id,
@@ -1891,6 +2073,8 @@ def send_email_message(site, to_email, subject, body_text, lead=None):
         'from_email': from_email,
         'from_name': from_name,
         'reply_to_email': reply_to_email,
+        'reply_routing_mode': reply_routing_mode,
+        'lead_reply_alias_email': lead_reply_alias_email,
         'delivery_mode': profile.get('delivery_mode') or 'platform_domain',
         'transport_mode': profile.get('transport_mode') or 'platform_smtp',
         'subject': subject,
@@ -1918,6 +2102,8 @@ def send_email_message(site, to_email, subject, body_text, lead=None):
             'from_email': from_email,
             'from_name': from_name,
             'reply_to_email': reply_to_email,
+            'reply_routing_mode': reply_routing_mode,
+            'lead_reply_alias_email': lead_reply_alias_email,
             'transport_mode': profile.get('transport_mode') or 'platform_smtp',
             'lead_reply_token': lead_reply_token,
             'message_id': message_id,
@@ -1934,6 +2120,8 @@ def send_email_message(site, to_email, subject, body_text, lead=None):
             'from_email': from_email,
             'from_name': from_name,
             'reply_to_email': reply_to_email,
+            'reply_routing_mode': reply_routing_mode,
+            'lead_reply_alias_email': lead_reply_alias_email,
             'transport_mode': profile.get('transport_mode') or 'platform_smtp',
             'lead_reply_token': lead_reply_token,
             'message_id': message_id,
